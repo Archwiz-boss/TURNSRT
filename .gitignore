@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+
+.streamlit/secrets.toml
+
+temp_uploads/
+outputs/
+models/
+
+*.mp3
+*.mp4
+*.m4a
+*.mkv
+*.wav
+*.vtt
+*.srt
+*.tsv
