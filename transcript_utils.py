@@ -220,20 +220,39 @@ def range_suffix(start_seconds: float, end_seconds: float, full_duration: float)
     return f"__{compact(start_seconds)}_to_{compact(end_seconds)}"
 
 
-def format_hhmmss(seconds: float) -> str:
-    """Format a media position without exposing raw total seconds."""
-    whole_seconds = max(0, int(round(seconds)))
-    hours, remainder = divmod(whole_seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+def format_hhmmss(seconds: float, *, include_milliseconds: bool = False) -> str:
+    """Format a media position as HH:MM:SS, optionally including milliseconds."""
+    if not include_milliseconds:
+        whole_seconds = max(0, int(round(seconds)))
+        hours, remainder = divmod(whole_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    milliseconds = max(0, int(round(seconds * 1000)))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, millis = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
 
 
 def parse_hhmmss(value: str) -> float:
-    """Parse HH:MM:SS; hours may be greater than 23 for long recordings."""
+    """Parse HH:MM:SS[.mmm]; hours may be greater than 23."""
     parts = value.strip().split(":")
-    if len(parts) != 3 or any(not part.isdigit() for part in parts):
-        raise ValueError("時間必須使用 HH:MM:SS 格式，例如 01:23:45。")
-    hours, minutes, seconds = (int(part) for part in parts)
+    if len(parts) != 3 or not parts[0].isdigit() or not parts[1].isdigit():
+        raise ValueError("時間必須使用 HH:MM:SS 或 HH:MM:SS.mmm 格式。")
+
+    second_parts = parts[2].split(".")
+    if (
+        len(second_parts) > 2
+        or not second_parts[0].isdigit()
+        or (len(second_parts) == 2 and not second_parts[1].isdigit())
+    ):
+        raise ValueError("時間必須使用 HH:MM:SS 或 HH:MM:SS.mmm 格式。")
+
+    hours = int(parts[0])
+    minutes = int(parts[1])
+    seconds = int(second_parts[0])
+    fraction = float(f"0.{second_parts[1]}") if len(second_parts) == 2 else 0.0
     if minutes >= 60 or seconds >= 60:
         raise ValueError("分鐘與秒數必須介於 00 到 59。")
-    return float(hours * 3600 + minutes * 60 + seconds)
+    return float(hours * 3600 + minutes * 60 + seconds) + fraction

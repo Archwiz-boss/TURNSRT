@@ -1,6 +1,6 @@
-streamlit>=1.34
-openai-whisper>=20231117
-torch>=2.2
-plotly>=5.20
-numpy>=1.26
-opencc-python-reimplemented>=0.1.7
+streamlit>=1.45,<2
+openai-whisper==20250625
+torch>=2.2,<3
+plotly>=5.20,<7
+numpy>=1.26,<3
+opencc-python-reimplemented>=0.1.7,<1

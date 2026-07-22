@@ -112,11 +112,18 @@ class TranscriptUtilsTests(unittest.TestCase):
     def test_hhmmss_format_and_parse(self):
         self.assertEqual(format_hhmmss(0), "00:00:00")
         self.assertEqual(format_hhmmss(7981.567), "02:13:02")
+        self.assertEqual(
+            format_hhmmss(7981.567, include_milliseconds=True),
+            "02:13:01.567",
+        )
         self.assertEqual(format_hhmmss(27 * 3600 + 65), "27:01:05")
         self.assertEqual(parse_hhmmss("02:13:02"), 7982.0)
+        self.assertEqual(parse_hhmmss("02:13:01.567"), 7981.567)
         self.assertEqual(parse_hhmmss("27:01:05"), 27 * 3600 + 65)
         with self.assertRaises(ValueError):
             parse_hhmmss("02:99:00")
+        with self.assertRaises(ValueError):
+            parse_hhmmss("02:13:01.bad")
         with self.assertRaises(ValueError):
             parse_hhmmss("7982")
 

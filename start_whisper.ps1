@@ -3,7 +3,7 @@ param(
     [string]$CondaHook,
 
     [Parameter(Mandatory = $true)]
-    [string]$CondaPath,
+    [string]$CondaEnvironment,
 
     [int]$UploadLimitMb = 5000
 )
@@ -22,10 +22,29 @@ if (-not (Test-Path -LiteralPath $CondaHook)) {
 }
 
 . $CondaHook
-conda activate $CondaPath
+conda activate $CondaEnvironment
+
+if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+    Write-Host "[ERROR] Python was not found after activating Conda."
+    exit 1
+}
 
 if (-not (Get-Command streamlit -ErrorAction SilentlyContinue)) {
     Write-Host "[ERROR] streamlit was not found after activating Conda."
+    Write-Host "Run: pip install -r requirements.txt"
+    exit 1
+}
+
+if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue) -or
+    -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+    Write-Host "[ERROR] FFmpeg or FFprobe was not found on PATH."
+    Write-Host "Install FFmpeg and make sure both commands work in a terminal."
+    exit 1
+}
+
+python -c "import numpy, opencc, plotly, streamlit, torch, whisper" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ERROR] One or more Python packages are missing."
     Write-Host "Run: pip install -r requirements.txt"
     exit 1
 }
