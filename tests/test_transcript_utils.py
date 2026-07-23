@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from transcript_utils import (
+    build_result_from_words,
     build_waveform,
     convert_result_text,
     extract_audio_range,
@@ -108,6 +109,43 @@ class TranscriptUtilsTests(unittest.TestCase):
             range_suffix(65.25, 70.5, 100.0),
             "__00-01-05.250_to_00-01-10.500",
         )
+
+    def test_build_result_from_words_splits_on_sentence_punctuation(self):
+        words = ["Hello", ",", "world", ".", "Next", "sentence", "."]
+        timestamps_ms = [
+            [0, 100], [100, 150], [200, 400], [400, 450],
+            [1000, 1100], [1150, 1400], [1400, 1450],
+        ]
+        result = build_result_from_words(words, timestamps_ms)
+        self.assertEqual(len(result["segments"]), 2)
+        self.assertEqual(result["segments"][0]["text"], "Hello, world.")
+        self.assertEqual(result["segments"][0]["start"], 0.0)
+        self.assertEqual(result["segments"][0]["end"], 0.45)
+        self.assertEqual(result["segments"][1]["text"], "Next sentence.")
+        self.assertEqual(result["segments"][1]["start"], 1.0)
+
+    def test_build_result_from_words_cjk_latin_boundary_spacing(self):
+        words = ["我們", "討論", "project", "的", "schedule", "。"]
+        timestamps_ms = [[0, 100], [100, 200], [200, 400], [400, 450], [450, 700], [700, 750]]
+        result = build_result_from_words(words, timestamps_ms)
+        self.assertEqual(result["segments"][0]["text"], "我們討論 project 的 schedule。")
+
+    def test_build_result_from_words_matches_whisper_writer_word_join(self):
+        # whisper.utils's subtitle writers reconstruct text via "".join(word["word"] ...)
+        # whenever segment["words"] is present, so each stored word must carry its own
+        # leading space already baked in.
+        words = ["Hello", "there"]
+        timestamps_ms = [[0, 100], [200, 300]]
+        result = build_result_from_words(words, timestamps_ms)
+        joined = "".join(w["word"] for w in result["segments"][0]["words"])
+        self.assertEqual(joined, "Hello there")
+
+    def test_sensevoice_special_tokens_are_stripped(self):
+        from whisper_app import _SENSEVOICE_TAG
+
+        raw = "<|en|><|HAPPY|><|Laughter|>Hello"
+        self.assertEqual(_SENSEVOICE_TAG.sub("", raw).strip(), "Hello")
+        self.assertEqual(_SENSEVOICE_TAG.sub("", "<|BGM|>").strip(), "")
 
     def test_hhmmss_format_and_parse(self):
         self.assertEqual(format_hhmmss(0), "00:00:00")

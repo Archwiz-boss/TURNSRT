@@ -256,3 +256,85 @@ def parse_hhmmss(value: str) -> float:
     if minutes >= 60 or seconds >= 60:
         raise ValueError("分鐘與秒數必須介於 00 到 59。")
     return float(hours * 3600 + minutes * 60 + seconds) + fraction
+
+
+_SENTENCE_END_CHARS = set(".!?。！？")
+_NO_LEADING_SPACE_CHARS = set(",.!?;:，。！？；：、）】」』")
+
+
+def _is_cjk(char: str) -> bool:
+    code = ord(char)
+    return (
+        0x4E00 <= code <= 0x9FFF
+        or 0x3400 <= code <= 0x4DBF
+        or 0x3040 <= code <= 0x30FF
+        or 0xAC00 <= code <= 0xD7A3
+        or 0xF900 <= code <= 0xFAFF
+    )
+
+
+def _prefix_word(prev_char: str | None, token: str) -> str:
+    """Prepend a space to `token` the way Whisper's own tokenizer would (CJK-aware).
+
+    No space between two CJK characters or before attaching punctuation; a space is
+    kept at CJK<->Latin boundaries so mixed Chinese/English text stays readable.
+    """
+    if prev_char is None:
+        return token
+    next_char = token[0]
+    if next_char in _NO_LEADING_SPACE_CHARS:
+        needs_space = False
+    elif _is_cjk(prev_char) and _is_cjk(next_char):
+        needs_space = False
+    else:
+        needs_space = True
+    return (" " if needs_space else "") + token
+
+
+def build_result_from_words(
+    words: list[str],
+    timestamps_ms: list[tuple[float, float]],
+    max_segment_seconds: float = 12.0,
+    max_segment_words: int = 40,
+) -> dict[str, Any]:
+    """Group word-level ASR timestamps (ms) into Whisper-style segments/result.
+
+    Each stored word carries its leading space baked in (matching OpenAI Whisper's
+    own tokenizer convention), because whisper.utils's subtitle writers reconstruct
+    text via a plain "".join() over segment["words"] whenever that key is present.
+    """
+    segments: list[dict[str, Any]] = []
+    current_words: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        if not current_words:
+            return
+        segment_text = "".join(w["word"] for w in current_words).strip()
+        segments.append(
+            {
+                "start": current_words[0]["start"],
+                "end": current_words[-1]["end"],
+                "text": segment_text,
+                "words": [dict(w) for w in current_words],
+            }
+        )
+        current_words.clear()
+
+    for word, (start_ms, end_ms) in zip(words, timestamps_ms):
+        prev_char = current_words[-1]["word"][-1] if current_words else None
+        current_words.append(
+            {
+                "word": _prefix_word(prev_char, word),
+                "start": start_ms / 1000.0,
+                "end": end_ms / 1000.0,
+            }
+        )
+        duration = current_words[-1]["end"] - current_words[0]["start"]
+        if word.strip() in _SENTENCE_END_CHARS:
+            flush()
+        elif duration >= max_segment_seconds or len(current_words) >= max_segment_words:
+            flush()
+    flush()
+
+    full_text = " ".join(segment["text"] for segment in segments)
+    return {"text": full_text, "segments": segments}

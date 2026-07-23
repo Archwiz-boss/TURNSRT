@@ -4,6 +4,7 @@ import gc
 import hashlib
 import importlib
 import os
+import re
 import shutil
 import time
 import uuid
@@ -18,6 +19,7 @@ from opencc import OpenCC
 
 from transcript_utils import (
     MediaProcessingError,
+    build_result_from_words,
     build_waveform,
     convert_result_text,
     extract_audio_range,
@@ -51,6 +53,17 @@ LANGUAGE_OPTIONS = {
     "日文": "Japanese",
     "韓文": "Korean",
 }
+ENGINE_WHISPER = "Whisper（OpenAI）"
+ENGINE_SENSEVOICE = "SenseVoice-small（中英混合推薦）"
+SENSEVOICE_MODEL_LABEL = "SenseVoice-small"
+SENSEVOICE_LANGUAGE_OPTIONS = {
+    "自動偵測（中英混合建議）": "auto",
+    "中文": "zh",
+    "英文": "en",
+    "粵語": "yue",
+    "日文": "ja",
+    "韓文": "ko",
+}
 MIME_TYPES = {
     "txt": "text/plain",
     "vtt": "text/vtt",
@@ -75,6 +88,52 @@ def load_whisper_model(model_size: str, device: str):
 @st.cache_resource(show_spinner=False)
 def load_chinese_converter(config: str):
     return OpenCC(config)
+
+
+@st.cache_resource(show_spinner=False, max_entries=1)
+def load_sensevoice_model(device: str):
+    from funasr import AutoModel
+
+    return AutoModel(
+        model="FunAudioLLM/SenseVoiceSmall",
+        hub="hf",
+        trust_remote_code=True,
+        vad_model="fsmn-vad",
+        vad_kwargs={"max_single_segment_time": 30000},
+        device="cuda:0" if device == "cuda" else "cpu",
+        disable_update=True,
+    )
+
+
+# SenseVoice can emit special tokens for language / emotion / audio events
+# (e.g. <|zh|>, <|HAPPY|>, <|BGM|>, <|Laughter|>). These must not leak into subtitles.
+_SENSEVOICE_TAG = re.compile(r"<\|[^|]*\|>")
+
+
+def transcribe_with_sensevoice(model, audio_path: str, language: str) -> dict:
+    results = model.generate(
+        input=audio_path,
+        cache={},
+        language=language or "auto",
+        use_itn=True,
+        batch_size_s=60,
+        merge_vad=False,
+        merge_length_s=15,
+        output_timestamp=True,
+    )
+    if not results:
+        return {"text": "", "segments": []}
+    item = results[0]
+    raw_words = item.get("words") or []
+    raw_timestamps = item.get("timestamp") or []
+    words: list[str] = []
+    timestamps: list = []
+    for word, timestamp in zip(raw_words, raw_timestamps):
+        cleaned = _SENSEVOICE_TAG.sub("", word).strip()
+        if cleaned:
+            words.append(cleaned)
+            timestamps.append(timestamp)
+    return build_result_from_words(words, timestamps)
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -236,6 +295,7 @@ def reset_selected_range(
 
 def release_cached_model() -> None:
     load_whisper_model.clear()
+    load_sensevoice_model.clear()
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -367,15 +427,31 @@ def main():
 
     st.sidebar.header("轉譯設定")
     st.sidebar.caption(device_label)
-    model_label = st.sidebar.selectbox(
-        "速度與品質",
-        list(MODEL_OPTIONS),
+    engine = st.sidebar.selectbox(
+        "辨識引擎",
+        [ENGINE_WHISPER, ENGINE_SENSEVOICE],
         index=0,
-        help="Turbo 適合先快速產生字幕；重要成品可再用 Large v3 比對。",
+        help="SenseVoice-small 對中英夾雜的辨識效果較好、推論較快；"
+        "首次使用會從 Hugging Face 下載約 1GB 的模型。",
     )
-    model_size = MODEL_OPTIONS[model_label]
-    language_label = st.sidebar.selectbox("語音語言", list(LANGUAGE_OPTIONS), index=0)
-    language = LANGUAGE_OPTIONS[language_label]
+    if engine == ENGINE_WHISPER:
+        model_label = st.sidebar.selectbox(
+            "速度與品質",
+            list(MODEL_OPTIONS),
+            index=0,
+            help="Turbo 適合先快速產生字幕；重要成品可再用 Large v3 比對。",
+        )
+        model_size = MODEL_OPTIONS[model_label]
+        model_display = model_size
+        language_label = st.sidebar.selectbox("語音語言", list(LANGUAGE_OPTIONS), index=0)
+        language = LANGUAGE_OPTIONS[language_label]
+    else:
+        model_size = None
+        model_display = SENSEVOICE_MODEL_LABEL
+        language_label = st.sidebar.selectbox(
+            "語音語言", list(SENSEVOICE_LANGUAGE_OPTIONS), index=0
+        )
+        language = SENSEVOICE_LANGUAGE_OPTIONS[language_label]
     chinese_output_label = st.sidebar.selectbox(
         "中文字體輸出",
         list(CHINESE_OUTPUT_OPTIONS),
@@ -584,7 +660,7 @@ def main():
     st.header("3. 轉譯與輸出")
     result_key = result_state_key(source_id)
     run_transcription = st.button(
-        f"開始轉譯｜{model_size}",
+        f"開始轉譯｜{model_display}",
         type="primary",
         disabled=duration_selected < 0.5 or not output_format,
         use_container_width=True,
@@ -605,25 +681,35 @@ def main():
             extraction_seconds = time.perf_counter() - phase_started
 
             phase_started = time.perf_counter()
-            with st.spinner(f"2/3 正在載入 {model_size} 模型..."):
-                model = load_whisper_model(model_size, device)
+            if engine == ENGINE_WHISPER:
+                with st.spinner(f"2/3 正在載入 {model_size} 模型..."):
+                    model = load_whisper_model(model_size, device)
+            else:
+                with st.spinner("2/3 正在載入 SenseVoice-small 模型（首次使用會下載模型）..."):
+                    model = load_sensevoice_model(device)
             model_load_seconds = time.perf_counter() - phase_started
 
             phase_started = time.perf_counter()
-            status_text = st.empty()
-            progress_bar = st.progress(0)
-            status_text.text("3/3 正在進行語音識別...")
-            transcribe_options = {
-                "language": language,
-                "verbose": False,
-                "fp16": device == "cuda",
-            }
-            if initial_prompt.strip():
-                transcribe_options["initial_prompt"] = initial_prompt.strip()
-            if model_size == "turbo":
-                transcribe_options["temperature"] = 0.0
-            with show_whisper_progress(progress_bar, status_text):
-                result = model.transcribe(str(extracted_audio), **transcribe_options)
+            if engine == ENGINE_WHISPER:
+                status_text = st.empty()
+                progress_bar = st.progress(0)
+                status_text.text("3/3 正在進行語音識別...")
+                transcribe_options = {
+                    "language": language,
+                    "verbose": False,
+                    "fp16": device == "cuda",
+                }
+                if initial_prompt.strip():
+                    transcribe_options["initial_prompt"] = initial_prompt.strip()
+                if model_size == "turbo":
+                    transcribe_options["temperature"] = 0.0
+                with show_whisper_progress(progress_bar, status_text):
+                    result = model.transcribe(str(extracted_audio), **transcribe_options)
+            else:
+                with st.spinner("3/3 正在進行語音識別..."):
+                    result = transcribe_with_sensevoice(
+                        model, str(extracted_audio), language
+                    )
             inference_seconds = time.perf_counter() - phase_started
 
             phase_started = time.perf_counter()
@@ -642,7 +728,8 @@ def main():
                 "start": selected_start,
                 "end": selected_end,
                 "source_duration": duration,
-                "model": model_size,
+                "engine": engine,
+                "model": model_display,
                 "language": language_label,
                 "conversion": chinese_output_label,
                 "initial_prompt": initial_prompt.strip(),
@@ -672,7 +759,8 @@ def main():
     st.divider()
     st.subheader("轉譯結果")
     if (
-        record["model"] != model_size
+        record.get("engine") != engine
+        or record["model"] != model_display
         or record["language"] != language_label
         or record["conversion"] != chinese_output_label
         or record["initial_prompt"] != initial_prompt.strip()
