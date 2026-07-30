@@ -6,6 +6,9 @@ __pycache__/
 temp_uploads/
 outputs/
 models/
+glossary.json
+replacements.json
+*.bak.json
 
 *.mp3
 *.mp4

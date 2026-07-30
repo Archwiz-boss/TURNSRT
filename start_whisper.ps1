@@ -42,7 +42,7 @@ if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue) -or
     exit 1
 }
 
-python -c "import numpy, opencc, plotly, streamlit, torch, whisper" 2>$null
+python -c "import numpy, opencc, plotly, streamlit, torch, transformers, whisper" 2>$null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[ERROR] One or more Python packages are missing."
     Write-Host "Run: pip install -r requirements.txt"

@@ -1,6 +1,8 @@
 streamlit>=1.45,<2
 openai-whisper==20250625
 torch>=2.2,<3
+# v5 required: Breeze loading uses the renamed `dtype` argument of from_pretrained.
+transformers>=5,<6
 plotly>=5.20,<7
 numpy>=1.26,<3
 opencc-python-reimplemented>=0.1.7,<1
