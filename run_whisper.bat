@@ -8,6 +8,12 @@ cd /d "%~dp0"
 
 set "UPLOAD_LIMIT_MB=5000"
 
+rem Which address to listen on.
+rem   tailscale = only reachable over Tailscale (recommended; keeps it off the LAN)
+rem   <empty>   = listen on every interface, anyone on the local network can open it
+rem   <an IP>   = listen on that address only
+set "BIND_ADDRESS=tailscale"
+
 set "CONDA_PATH="
 
 rem Prefer the Conda that is already available on PATH.
@@ -60,7 +66,7 @@ echo Conda folder: %CONDA_PATH%
 echo Conda environment: %CONDA_ENV%
 echo [3/3] Starting Streamlit...
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start_whisper.ps1" -CondaHook "%PS_HOOK%" -CondaEnvironment "%CONDA_ENV%" -UploadLimitMb %UPLOAD_LIMIT_MB%
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start_whisper.ps1" -CondaHook "%PS_HOOK%" -CondaEnvironment "%CONDA_ENV%" -UploadLimitMb %UPLOAD_LIMIT_MB% -BindAddress "%BIND_ADDRESS%"
 set "EXIT_CODE=%ERRORLEVEL%"
 
 if not "%EXIT_CODE%"=="0" (

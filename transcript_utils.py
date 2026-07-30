@@ -4,6 +4,7 @@ import copy
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import wave
@@ -181,6 +182,59 @@ def extract_audio_range(
         message = completed.stderr.strip() or "無法擷取選定音訊範圍。"
         raise MediaProcessingError(message)
     return destination
+
+
+_CUE_TIME = re.compile(
+    r"(\d{1,3}):([0-5]?\d):([0-5]?\d)[,.](\d{1,3})\s*-->\s*"
+    r"(\d{1,3}):([0-5]?\d):([0-5]?\d)[,.](\d{1,3})"
+)
+
+
+def _cue_seconds(hours: str, minutes: str, seconds: str, millis: str) -> float:
+    return (
+        int(hours) * 3600
+        + int(minutes) * 60
+        + int(seconds)
+        + int(millis.ljust(3, "0")) / 1000.0
+    )
+
+
+def parse_srt(text: str) -> dict[str, Any]:
+    """Parse SRT cues into a Whisper-style result so existing subtitles can be re-edited.
+
+    Deliberately lenient: tolerates a BOM, CRLF, a WEBVTT header, missing or misnumbered
+    cue indices, and VTT's `.` millisecond separator. A cue spanning several lines is
+    joined with a space, because the editor and the writers both work one line per cue.
+    """
+    lines = text.lstrip("﻿").splitlines()
+    segments: list[dict[str, Any]] = []
+    index = 0
+    while index < len(lines):
+        match = _CUE_TIME.search(lines[index])
+        if not match:
+            index += 1
+            continue
+        start = _cue_seconds(*match.group(1, 2, 3, 4))
+        end = _cue_seconds(*match.group(5, 6, 7, 8))
+        index += 1
+
+        cue: list[str] = []
+        while index < len(lines):
+            line = lines[index].strip()
+            if not line or _CUE_TIME.search(line):
+                break
+            cue.append(line)
+            index += 1
+        # A cue index sitting directly above the next timestamp, with no blank line
+        # between the two cues, would otherwise be swallowed as subtitle text.
+        if len(cue) > 1 and cue[-1].isdigit():
+            cue.pop()
+
+        content = " ".join(cue).strip()
+        if content:
+            segments.append({"start": start, "end": max(end, start), "text": content})
+
+    return {"text": " ".join(segment["text"] for segment in segments), "segments": segments}
 
 
 def read_wav_mono(source: str | Path) -> np.ndarray:

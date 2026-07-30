@@ -5,6 +5,7 @@ import hashlib
 import importlib
 import re
 import shutil
+import tempfile
 import time
 import uuid
 from contextlib import contextmanager
@@ -49,6 +50,7 @@ from transcript_utils import (
     format_hhmmss,
     offset_result_timestamps,
     parse_hhmmss,
+    parse_srt,
     probe_duration,
     range_suffix,
     read_wav_mono,
@@ -72,6 +74,8 @@ ADVANCED_OPEN_KEY = "advanced_panel_open"
 STATUS_LABELS = {"pending": "待轉譯", "running": "轉譯中", "done": "完成", "error": "失敗"}
 UPLOAD_MODE = "拖曳上傳檔案（限制由系統設定）"
 PATH_MODE = "直接輸入電腦中的檔案路徑（無大小限制，最快）"
+SUBTITLE_MODE = "匯入現有字幕檔（SRT／VTT，直接編輯）"
+SUBTITLE_SUFFIXES = (".srt", ".vtt")
 OUTPUT_FORMATS = ["txt", "vtt", "srt", "tsv", "json"]
 MODEL_OPTIONS = {
     "快速｜Turbo（建議先試）": "turbo",
@@ -798,31 +802,69 @@ def release_cached_model() -> None:
     st.session_state["model_release_notice"] = True
 
 
-def write_result_files(
+def output_stem(record: dict) -> str:
+    """Base filename for this result: the source's own name plus any A-B range."""
+    suffix = range_suffix(record["start"], record["end"], record["source_duration"])
+    return f"{Path(record['source_path']).stem}{suffix}"
+
+
+def resolve_output_directory(record: dict) -> Path:
+    """Save next to the source file, so subtitles land beside the video they belong to.
+
+    An imported subtitle therefore writes back over itself, which is the point. Uploads
+    are the exception: their "source" is a temp folder, so those still go to outputs/.
+    """
+    source = Path(record["source_path"])
+    if not record.get("is_temp") and source.parent.is_dir():
+        return source.parent
+    return OUTPUT_DIR / source.stem
+
+
+def render_subtitle_files(
     record: dict,
-    input_path: Path,
     output_formats: list[str],
+    directory: Path,
+    stem: str,
 ) -> list[tuple[str, Path]]:
     from whisper.utils import get_writer
 
-    # Named after the media alone. The source hash used to be appended here too, which
-    # made every output path read as gibberish; A-B selections are already told apart by
-    # the range suffix below.
-    output_directory = OUTPUT_DIR / input_path.stem
-    output_directory.mkdir(parents=True, exist_ok=True)
-    suffix = range_suffix(record["start"], record["end"], record["source_duration"])
-    output_stem = f"{input_path.stem}{suffix}"
-    output_anchor = output_directory / f"{output_stem}{input_path.suffix}"
+    directory.mkdir(parents=True, exist_ok=True)
+    # The writers derive each output name from this anchor's stem; its suffix is ignored.
+    anchor = directory / f"{stem}.media"
     result = result_for_output(record)
     files: list[tuple[str, Path]] = []
     for extension in output_formats:
-        writer = get_writer(extension, str(output_directory))
-        writer(result, str(output_anchor))
-        output_file = output_directory / f"{output_stem}.{extension}"
+        writer = get_writer(extension, str(directory))
+        writer(result, str(anchor))
+        output_file = directory / f"{stem}.{extension}"
         if output_file.exists():
             files.append((extension, output_file))
-    record["output_directory"] = str(output_directory.absolute())
     return files
+
+
+def subtitle_payloads(record: dict, output_formats: list[str]) -> list[tuple[str, str, bytes]]:
+    """Build the download bytes in a temp folder.
+
+    Rendering used to write straight to the destination on every rerun, which was
+    harmless while everything landed in outputs/ but would silently overwrite the user's
+    own file now that results save next to their source. Nothing touches the destination
+    until the save button is pressed.
+    """
+    stem = output_stem(record)
+    with tempfile.TemporaryDirectory() as scratch:
+        return [
+            (extension, path.name, path.read_bytes())
+            for extension, path in render_subtitle_files(
+                record, output_formats, Path(scratch), stem
+            )
+        ]
+
+
+def save_result_files(record: dict, output_formats: list[str]) -> tuple[Path, list[Path]]:
+    directory = resolve_output_directory(record)
+    files = render_subtitle_files(record, output_formats, directory, output_stem(record))
+    record["output_directory"] = str(directory.absolute())
+    return directory, [path for _, path in files]
 
 
 def get_queue() -> list[dict]:
@@ -853,6 +895,74 @@ def enqueue_media(path: Path, *, is_temp: bool) -> str | None:
             "error": None,
             "record": None,
             "is_temp": is_temp,
+        }
+    )
+    return None
+
+
+def read_text_guess(path: Path) -> str:
+    """Read a subtitle file whose encoding is unknown.
+
+    Subtitles written on a Traditional Chinese Windows box are frequently cp950 rather
+    than UTF-8, and guessing wrong turns the whole file into mojibake.
+    """
+    for encoding in ("utf-8-sig", "cp950", "gb18030", "utf-16"):
+        try:
+            return path.read_text(encoding=encoding)
+        except (UnicodeDecodeError, UnicodeError, LookupError):
+            continue
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def enqueue_subtitle(path: Path, *, is_temp: bool) -> str | None:
+    """Import an existing subtitle straight into the results area for re-editing."""
+    queue = get_queue()
+    resolved = str(path.resolve())
+    if any(job["path"] == resolved for job in queue):
+        return f"{path.name}：已在佇列中"
+    try:
+        result = parse_srt(read_text_guess(path))
+    except OSError as exc:
+        return f"{path.name}：{exc}"
+    segments = result["segments"]
+    if not segments:
+        return f"{path.name}：找不到任何字幕時間碼，請確認是 SRT 或 VTT 檔"
+
+    duration = max(float(segment["end"]) for segment in segments)
+    queue.append(
+        {
+            "id": uuid.uuid4().hex[:8],
+            "path": resolved,
+            "name": path.name,
+            "duration": duration,
+            "start": 0.0,
+            "end": duration,
+            "status": "done",
+            "error": None,
+            "is_temp": is_temp,
+            "record": {
+                "id": uuid.uuid4().hex,
+                "result": result,
+                "source_path": resolved,
+                "source_name": path.name,
+                "start": 0.0,
+                "end": duration,
+                "source_duration": duration,
+                "engine": "匯入字幕",
+                "model": "—",
+                "language": "—",
+                "conversion": "—",
+                "initial_prompt": "",
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "edited": False,
+                "rule_hits": {},
+                "is_subtitle": True,
+                "is_temp": is_temp,
+                "original_texts": [str(segment.get("text", "")) for segment in segments],
+                "timings": dict.fromkeys(
+                    ("extraction", "model_load", "inference", "postprocess", "total"), 0.0
+                ),
+            },
         }
     )
     return None
@@ -950,6 +1060,7 @@ def transcribe_job(job: dict, settings: dict, device: str) -> dict:
             "result": result,
             "source_path": str(source_path),
             "source_name": job["name"],
+            "is_temp": job["is_temp"],
             "start": start,
             "end": end,
             "source_duration": float(job["duration"]),
@@ -1342,12 +1453,74 @@ def main():
     st.header("1. 加入待轉譯檔案")
     input_mode = st.radio(
         "輸入方式",
-        [UPLOAD_MODE, PATH_MODE],
+        [UPLOAD_MODE, PATH_MODE, SUBTITLE_MODE],
         horizontal=True,
         label_visibility="collapsed",
     )
 
-    if input_mode == UPLOAD_MODE:
+    if input_mode == SUBTITLE_MODE:
+        st.caption(
+            "匯入以前轉好的字幕，直接套用取代規則、修改文字後存回原檔。"
+            "不需要影片，但也因此無法逐段試聽。"
+        )
+        subtitle_upload, subtitle_path = st.tabs(["上傳字幕檔", "輸入字幕路徑"])
+        with subtitle_upload:
+            uploaded_subtitles = st.file_uploader(
+                "選擇字幕檔（可一次選多個）",
+                type=["srt", "vtt"],
+                accept_multiple_files=True,
+                key="subtitle_uploader",
+            )
+            if uploaded_subtitles and st.button(
+                f"匯入 {len(uploaded_subtitles)} 個字幕檔",
+                type="primary",
+                use_container_width=True,
+                key="import_uploaded_subtitles",
+            ):
+                problems = []
+                with st.spinner("正在讀取字幕..."):
+                    for uploaded_file in uploaded_subtitles:
+                        try:
+                            problems.append(
+                                enqueue_subtitle(save_uploaded_file(uploaded_file), is_temp=True)
+                            )
+                        except OSError as exc:
+                            problems.append(f"{uploaded_file.name}：{exc}")
+                st.session_state.enqueue_report = [p for p in problems if p]
+                st.rerun()
+            if uploaded_subtitles:
+                st.caption("上傳的字幕會存到 outputs/，無法覆蓋原始檔案；要覆蓋請改用路徑分頁。")
+        with subtitle_path:
+            subtitle_input = st.text_area(
+                "貼上字幕檔完整路徑，一行一個",
+                height=110,
+                placeholder="D:\\Videos\\1222.srt\nD:\\Videos\\1223.srt",
+                key="subtitle_path_input",
+            )
+            subtitle_candidates = [
+                line.strip().strip('"') for line in subtitle_input.splitlines()
+            ]
+            subtitle_candidates = [line for line in subtitle_candidates if line]
+            if subtitle_candidates and st.button(
+                f"匯入 {len(subtitle_candidates)} 個字幕檔",
+                type="primary",
+                use_container_width=True,
+                key="import_subtitle_paths",
+            ):
+                problems = []
+                with st.spinner("正在讀取字幕..."):
+                    for line in subtitle_candidates:
+                        candidate = Path(line)
+                        if not candidate.exists() or not candidate.is_file():
+                            problems.append(f"{line}：找不到檔案")
+                        elif candidate.suffix.lower() not in SUBTITLE_SUFFIXES:
+                            problems.append(f"{candidate.name}：不是 .srt 或 .vtt")
+                        else:
+                            problems.append(enqueue_subtitle(candidate, is_temp=False))
+                st.session_state.enqueue_report = [p for p in problems if p]
+                st.rerun()
+            st.caption("以路徑匯入時，儲存會直接覆蓋原始字幕檔。")
+    elif input_mode == UPLOAD_MODE:
         uploaded_files = st.file_uploader(
             "選擇影片或音檔（可一次選多個）",
             type=["mp4", "mkv", "mov", "avi", "mp3", "wav", "m4a"],
@@ -1723,36 +1896,44 @@ def render_results(output_formats: list[str]) -> None:
     source_path = Path(record["source_path"])
 
     if output_formats and st.button(
-        f"把全部 {len(finished)} 份結果寫入 outputs/",
+        f"把全部 {len(finished)} 份結果存到各自的來源資料夾",
         key="write_all_results",
         use_container_width=True,
+        help="每份結果都會存在它自己的原始檔案旁邊，並覆蓋同名檔案。",
     ):
         written, failures = 0, []
         for entry in finished:
             try:
-                write_result_files(
-                    entry["record"], Path(entry["record"]["source_path"]), output_formats
-                )
+                save_result_files(entry["record"], output_formats)
                 written += 1
             except Exception as exc:
                 failures.append(f"{entry['name']}：{exc}")
-        st.success(f"已寫出 {written} 份結果到 {OUTPUT_DIR.absolute()}。")
+        st.success(f"已儲存 {written} 份結果。")
         for failure in failures:
             st.error(failure)
 
     timings = record["timings"]
-    record_duration = record["end"] - record["start"]
-    realtime = record_duration / max(timings["inference"], 0.001)
-    result_metrics = st.columns(4)
-    result_metrics[0].metric("總耗時", f"{timings['total']:.1f} 秒")
-    result_metrics[1].metric("模型推論", f"{timings['inference']:.1f} 秒")
-    result_metrics[2].metric("處理速度", f"{realtime:.1f}× realtime")
-    result_metrics[3].metric("字幕段落", len(record["result"].get("segments", [])))
-    st.caption(
-        f"{record['created_at']}｜模型 {record['model']}｜語言 {record['language']}｜"
-        f"音訊 {timings['extraction']:.2f}s｜載入 {timings['model_load']:.2f}s｜"
-        f"後處理 {timings['postprocess']:.2f}s"
-    )
+    segment_count = len(record["result"].get("segments", []))
+    if record.get("is_subtitle"):
+        # An imported subtitle has no inference to report; realtime would divide by zero.
+        result_metrics = st.columns(3)
+        result_metrics[0].metric("字幕段落", segment_count)
+        result_metrics[1].metric("字幕長度", format_hhmmss(record["source_duration"]))
+        result_metrics[2].metric("狀態", "已修改" if record.get("edited") else "原始")
+        st.caption(f"{record['created_at']}｜匯入自 {record['source_path']}")
+    else:
+        record_duration = record["end"] - record["start"]
+        realtime = record_duration / max(timings["inference"], 0.001)
+        result_metrics = st.columns(4)
+        result_metrics[0].metric("總耗時", f"{timings['total']:.1f} 秒")
+        result_metrics[1].metric("模型推論", f"{timings['inference']:.1f} 秒")
+        result_metrics[2].metric("處理速度", f"{realtime:.1f}× realtime")
+        result_metrics[3].metric("字幕段落", segment_count)
+        st.caption(
+            f"{record['created_at']}｜模型 {record['model']}｜語言 {record['language']}｜"
+            f"音訊 {timings['extraction']:.2f}s｜載入 {timings['model_load']:.2f}s｜"
+            f"後處理 {timings['postprocess']:.2f}s"
+        )
     if record.get("rule_hits"):
         detail = "、".join(f"{find}×{count}" for find, count in record["rule_hits"].items())
         st.caption(f"轉譯後已自動套用取代規則：{detail}")
@@ -1788,19 +1969,46 @@ def render_results(output_formats: list[str]) -> None:
             st.warning("請先在左側選擇至少一種輸出格式。")
         else:
             try:
-                output_files = write_result_files(record, source_path, output_formats)
-                download_columns = st.columns(len(output_files))
-                for index, (extension, output_file) in enumerate(output_files):
+                destination = resolve_output_directory(record)
+                stem = output_stem(record)
+                st.markdown(f"**儲存位置**　`{destination}`")
+                if record.get("is_temp"):
+                    st.caption("上傳的檔案沒有原始路徑可寫回，因此存到 outputs/。")
+                else:
+                    st.caption("與原始檔案同一個資料夾。")
+
+                existing = [
+                    f"{stem}.{extension}"
+                    for extension in output_formats
+                    if (destination / f"{stem}.{extension}").exists()
+                ]
+                if existing:
+                    st.warning(f"按下儲存會覆蓋既有檔案：{'、'.join(existing)}")
+
+                if st.button(
+                    "儲存到上述位置",
+                    key=f"save_files_{record['id']}",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    saved_directory, saved_files = save_result_files(record, output_formats)
+                    st.success(
+                        f"已儲存 {len(saved_files)} 個檔案到 {saved_directory}："
+                        f"{'、'.join(path.name for path in saved_files)}"
+                    )
+
+                st.divider()
+                payloads = subtitle_payloads(record, output_formats)
+                download_columns = st.columns(len(payloads))
+                for index, (extension, filename, data) in enumerate(payloads):
                     download_columns[index].download_button(
                         label=f"下載 .{extension}",
-                        data=output_file.read_bytes(),
-                        file_name=output_file.name,
+                        data=data,
+                        file_name=filename,
                         mime=MIME_TYPES.get(extension, "text/plain"),
                         use_container_width=True,
                     )
-                st.caption(
-                    f"檔案位置：{record['output_directory']}｜字幕時間碼對應原始媒體。"
-                )
+                st.caption("下載不會寫入上面的位置；字幕時間碼對應原始媒體。")
             except Exception as exc:
                 st.error(f"無法產生輸出檔：{exc}")
 

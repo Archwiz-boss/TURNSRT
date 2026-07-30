@@ -5,7 +5,12 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$CondaEnvironment,
 
-    [int]$UploadLimitMb = 5000
+    [int]$UploadLimitMb = 5000,
+
+    # "" listens on every interface, "tailscale" resolves this machine's Tailscale
+    # address, or pass a literal IP. Binding to one address is what keeps the app off
+    # the local network.
+    [string]$BindAddress = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,5 +54,31 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-streamlit run whisper_app.py --server.maxUploadSize $UploadLimitMb
+if ($BindAddress -eq "tailscale") {
+    $tailscaleIp = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.InterfaceAlias -like "*Tailscale*" } |
+        Select-Object -First 1
+    if (-not $tailscaleIp) {
+        Write-Host "[ERROR] No Tailscale interface was found. Start Tailscale, or set"
+        Write-Host "BIND_ADDRESS= (empty) in run_whisper.bat to listen on all interfaces."
+        exit 1
+    }
+    $BindAddress = $tailscaleIp.IPAddress
+}
+
+$streamlitArgs = @("run", "whisper_app.py", "--server.maxUploadSize", $UploadLimitMb)
+if ($BindAddress) {
+    $streamlitArgs += @("--server.address", $BindAddress)
+    Write-Host ""
+    Write-Host "Listening on $BindAddress only - the local network cannot reach this."
+    Write-Host "Open http://${BindAddress}:8501 (works on this machine too; localhost will not)."
+    Write-Host ""
+}
+else {
+    Write-Host ""
+    Write-Host "Listening on all interfaces - anyone on your local network can open this."
+    Write-Host ""
+}
+
+streamlit @streamlitArgs
 exit $LASTEXITCODE
