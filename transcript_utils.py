@@ -6,10 +6,15 @@ import math
 import os
 import shutil
 import subprocess
+import wave
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+
+# Above this reading speed a Chinese subtitle line is usually too dense to follow.
+FAST_SUBTITLE_CPS = 9.0
 
 
 class MediaProcessingError(RuntimeError):
@@ -178,6 +183,77 @@ def extract_audio_range(
     return destination
 
 
+def read_wav_mono(source: str | Path) -> np.ndarray:
+    """Read a 16-bit PCM WAV as float32 samples in [-1, 1], averaging channels to mono.
+
+    Used for the Hugging Face pipelines, which want a bare waveform array. Only the
+    format `extract_audio_range` writes (16 kHz mono s16le) needs to be supported.
+    """
+    with wave.open(str(source), "rb") as handle:
+        if handle.getsampwidth() != 2:
+            raise MediaProcessingError("只支援 16-bit PCM WAV。")
+        channels = handle.getnchannels()
+        frames = handle.readframes(handle.getnframes())
+    samples = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1)
+    return samples
+
+
+def build_result_from_chunks(
+    chunks: list[dict[str, Any]],
+    total_duration: float | None = None,
+) -> dict[str, Any]:
+    """Convert Hugging Face ASR pipeline chunks into a Whisper-style result.
+
+    The pipeline yields {"timestamp": (start, end), "text": ...}. Whisper's sequential
+    long-form decoding routinely leaves the final chunk's end open (None) and can emit a
+    chunk with no timestamp at all, so both ends are repaired from the neighbouring
+    chunk, falling back to the clip duration.
+    """
+    parsed: list[tuple[float | None, float | None, str]] = []
+    for chunk in chunks or []:
+        text = str(chunk.get("text", "")).strip()
+        if not text:
+            continue
+        timestamp = chunk.get("timestamp") or ()
+        start = timestamp[0] if len(timestamp) > 0 else None
+        end = timestamp[1] if len(timestamp) > 1 else None
+        parsed.append(
+            (
+                float(start) if start is not None else None,
+                float(end) if end is not None else None,
+                text,
+            )
+        )
+    if not parsed:
+        return {"text": "", "segments": []}
+
+    # Missing starts resolve forwards from the previous chunk's end.
+    starts: list[float] = []
+    previous_end = 0.0
+    for start, end, _ in parsed:
+        resolved = start if start is not None else previous_end
+        starts.append(resolved)
+        previous_end = end if end is not None else resolved
+
+    # Missing ends resolve backwards from the next chunk's start.
+    ends: list[float] = [0.0] * len(parsed)
+    next_start = float(total_duration) if total_duration is not None else None
+    for index in range(len(parsed) - 1, -1, -1):
+        end = parsed[index][1]
+        if end is None:
+            end = next_start if next_start is not None else starts[index]
+        ends[index] = max(float(end), starts[index])
+        next_start = starts[index]
+
+    segments = [
+        {"start": starts[index], "end": ends[index], "text": text}
+        for index, (_, _, text) in enumerate(parsed)
+    ]
+    return {"text": " ".join(segment["text"] for segment in segments), "segments": segments}
+
+
 def offset_result_timestamps(result: dict[str, Any], offset_seconds: float) -> dict[str, Any]:
     shifted = copy.deepcopy(result)
     if not offset_seconds:
@@ -204,6 +280,146 @@ def convert_result_text(result: dict[str, Any], converter: Any) -> dict[str, Any
             if isinstance(word.get("word"), str):
                 word["word"] = converter.convert(word["word"])
     return converted
+
+
+def set_segment_text(segment: dict[str, Any], text: str) -> bool:
+    """Replace a segment's text, keeping its original leading whitespace. True if changed."""
+    old_text = str(segment.get("text", ""))
+    prefix = old_text[: len(old_text) - len(old_text.lstrip())]
+    new_text = prefix + str(text).strip()
+    if new_text == old_text:
+        return False
+    segment["text"] = new_text
+    return True
+
+
+def rebuild_result_text(result: dict[str, Any]) -> None:
+    result["text"] = "".join(str(segment.get("text", "")) for segment in result.get("segments", []))
+
+
+def update_result_from_editor(record: dict[str, Any], edited_rows: Any) -> int:
+    """Apply edited table rows back onto segments, matching on the 段落 number.
+
+    Row position is deliberately not used: the table may be filtered by a search box,
+    in which case row 0 is not segment 0.
+    """
+    rows = edited_rows.to_dict("records") if hasattr(edited_rows, "to_dict") else list(edited_rows)
+    segments = record["result"].get("segments", [])
+    changed = 0
+    for row in rows:
+        try:
+            index = int(row.get("段落", 0)) - 1
+        except (TypeError, ValueError):
+            continue
+        if 0 <= index < len(segments) and set_segment_text(segments[index], row.get("字幕", "")):
+            changed += 1
+    if changed:
+        rebuild_result_text(record["result"])
+        record["edited"] = True
+    return changed
+
+
+def replace_across_segments(record: dict[str, Any], search: str, replacement: str) -> int:
+    """Replace every occurrence of `search` in every segment; returns segments touched."""
+    if not search:
+        return 0
+    changed = 0
+    for segment in record["result"].get("segments", []):
+        text = str(segment.get("text", ""))
+        if search in text and set_segment_text(segment, text.replace(search, replacement)):
+            changed += 1
+    if changed:
+        rebuild_result_text(record["result"])
+        record["edited"] = True
+    return changed
+
+
+def apply_replacement_rules(
+    record: dict[str, Any],
+    rules: list[tuple[str, str]],
+) -> tuple[int, dict[str, int]]:
+    """Run every (find, replace) pair over all segments in one pass.
+
+    Returns the number of segments touched plus a per-rule hit count, so the UI can show
+    which saved rules actually did something on this transcript.
+    """
+    if not rules:
+        return 0, {}
+    hits = {find: 0 for find, _ in rules}
+    changed = 0
+    for segment in record["result"].get("segments", []):
+        text = str(segment.get("text", ""))
+        updated = text
+        for find, replace in rules:
+            if find and find in updated:
+                hits[find] += updated.count(find)
+                updated = updated.replace(find, replace)
+        if updated != text and set_segment_text(segment, updated):
+            changed += 1
+    if changed:
+        rebuild_result_text(record["result"])
+        record["edited"] = True
+    return changed, hits
+
+
+def restore_original_text(record: dict[str, Any]) -> int:
+    """Undo every edit using the snapshot taken right after transcription."""
+    originals = record.get("original_texts") or []
+    segments = record["result"].get("segments", [])
+    changed = sum(
+        set_segment_text(segment, original)
+        for segment, original in zip(segments, originals)
+    )
+    if changed:
+        rebuild_result_text(record["result"])
+    record["edited"] = False
+    return changed
+
+
+def segment_rows(
+    segments: list[dict[str, Any]],
+    search: str = "",
+    only_dense: bool = False,
+) -> list[dict[str, Any]]:
+    """Build editor table rows, optionally filtered by text or by reading speed."""
+    rows: list[dict[str, Any]] = []
+    needle = search.strip().lower()
+    for index, segment in enumerate(segments):
+        text = str(segment.get("text", "")).strip()
+        if needle and needle not in text.lower():
+            continue
+        start = float(segment.get("start", 0.0))
+        span = max(float(segment.get("end", start)) - start, 0.0)
+        speed = round(len(text) / span, 1) if span >= 0.05 else 0.0
+        if only_dense and speed <= FAST_SUBTITLE_CPS:
+            continue
+        rows.append(
+            {
+                "段落": index + 1,
+                "開始": format_hhmmss(start, include_milliseconds=True),
+                "長度": round(span, 2),
+                "字/秒": speed,
+                "字幕": text,
+            }
+        )
+    return rows
+
+
+def result_for_output(record: dict[str, Any]) -> dict[str, Any]:
+    """Return the result to hand to whisper's writers, dropping stale word timings.
+
+    whisper.utils' SRT/VTT writers rebuild each line by joining segment["words"]
+    whenever that key is present, so manually edited text would be silently discarded.
+    The key has to go from every segment, not just the edited ones: those writers test
+    only segments[0] before indexing ["words"] on all of them.
+    """
+    result = record["result"]
+    if not record.get("edited") or not any("words" in seg for seg in result.get("segments", [])):
+        return result
+    stripped = copy.deepcopy(result)
+    for segment in stripped.get("segments", []):
+        segment.pop("words", None)
+    return stripped
 
 
 def range_suffix(start_seconds: float, end_seconds: float, full_duration: float) -> str:
