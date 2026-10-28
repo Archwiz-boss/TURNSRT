@@ -459,6 +459,56 @@ def segment_rows(
     return rows
 
 
+def paginate_rows(
+    rows: list[dict[str, Any]],
+    page: int,
+    page_size: int = 10,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Return one editor page plus a clamped page number and the total page count."""
+    if page_size < 1:
+        raise ValueError("page_size must be at least 1")
+    total_pages = max(1, (len(rows) + page_size - 1) // page_size)
+    try:
+        requested_page = int(page)
+    except (TypeError, ValueError):
+        requested_page = 1
+    current_page = max(1, min(requested_page, total_pages))
+    start = (current_page - 1) * page_size
+    return rows[start : start + page_size], current_page, total_pages
+
+
+def editor_rows_from_delta(
+    visible_rows: list[dict[str, Any]],
+    widget_state: Any,
+) -> list[dict[str, Any]]:
+    """Map Streamlit data-editor cell changes back to stable subtitle numbers."""
+    if not isinstance(widget_state, dict):
+        return []
+    edited = widget_state.get("edited_rows")
+    if not isinstance(edited, dict):
+        return []
+
+    changed_rows: list[dict[str, Any]] = []
+    for raw_index, changes in edited.items():
+        try:
+            row_index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        if (
+            not 0 <= row_index < len(visible_rows)
+            or not isinstance(changes, dict)
+            or "字幕" not in changes
+        ):
+            continue
+        changed_rows.append(
+            {
+                "段落": visible_rows[row_index].get("段落"),
+                "字幕": changes.get("字幕", ""),
+            }
+        )
+    return changed_rows
+
+
 def result_for_output(record: dict[str, Any]) -> dict[str, Any]:
     """Return the result to hand to whisper's writers, dropping stale word timings.
 

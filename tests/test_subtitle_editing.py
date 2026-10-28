@@ -5,6 +5,8 @@ import unittest
 from transcript_utils import (
     FAST_SUBTITLE_CPS,
     rebuild_result_text,
+    editor_rows_from_delta,
+    paginate_rows,
     replace_across_segments,
     restore_original_text,
     result_for_output,
@@ -158,6 +160,43 @@ class SegmentRowsTests(unittest.TestCase):
     def test_zero_length_segment_does_not_divide_by_zero(self):
         record = make_record(["卡住"], spans=[(1.0, 1.0)])
         self.assertEqual(segment_rows(record["result"]["segments"])[0]["字/秒"], 0.0)
+
+
+class PaginationTests(unittest.TestCase):
+    def setUp(self):
+        self.rows = [{"段落": number, "字幕": str(number)} for number in range(1, 26)]
+
+    def test_returns_one_page_without_overlapping_rows(self):
+        visible, page, total_pages = paginate_rows(self.rows, 2, 10)
+        self.assertEqual([row["段落"] for row in visible], list(range(11, 21)))
+        self.assertEqual((page, total_pages), (2, 3))
+
+    def test_clamps_a_stale_page_after_filtering(self):
+        visible, page, total_pages = paginate_rows(self.rows[:3], 99, 10)
+        self.assertEqual([row["段落"] for row in visible], [1, 2, 3])
+        self.assertEqual((page, total_pages), (1, 1))
+
+    def test_empty_results_still_report_one_page(self):
+        self.assertEqual(paginate_rows([], 4, 10), ([], 1, 1))
+
+    def test_rejects_invalid_page_size(self):
+        with self.assertRaises(ValueError):
+            paginate_rows(self.rows, 1, 0)
+
+
+class EditorDeltaTests(unittest.TestCase):
+    def test_maps_visible_row_index_to_stable_segment_number(self):
+        visible = [{"段落": 41, "字幕": "甲"}, {"段落": 42, "字幕": "乙"}]
+        state = {"edited_rows": {"1": {"字幕": "修改後"}}}
+        self.assertEqual(
+            editor_rows_from_delta(visible, state),
+            [{"段落": 42, "字幕": "修改後"}],
+        )
+
+    def test_ignores_non_text_changes_and_invalid_indexes(self):
+        visible = [{"段落": 8, "字幕": "原文"}]
+        state = {"edited_rows": {"0": {"開始": "00:00:01"}, "9": {"字幕": "錯列"}}}
+        self.assertEqual(editor_rows_from_delta(visible, state), [])
 
 
 class ResultForOutputTests(unittest.TestCase):

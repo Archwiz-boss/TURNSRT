@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import html
 import importlib
 import re
 import shutil
@@ -47,8 +48,10 @@ from transcript_utils import (
     build_waveform,
     convert_result_text,
     extract_audio_range,
+    editor_rows_from_delta,
     format_hhmmss,
     offset_result_timestamps,
+    paginate_rows,
     parse_hhmmss,
     parse_srt,
     probe_duration,
@@ -63,6 +66,435 @@ from transcript_utils import (
 
 st.set_page_config(page_title="Whisper AI 語音轉文字工具", page_icon="🎙️", layout="wide")
 
+# Camping / earth-tone palette, low-saturation, minimalist. Colors mirror
+# .streamlit/config.toml; kept here too because alerts, tabs, and borders
+# aren't reachable through Streamlit's theme config alone.
+#
+# Every text/background pair below was checked for contrast (body text >= 4.5:1). The
+# earlier version left captions on Streamlit's default #A3A8B8 (2.2:1 on the paper
+# colour) and forced primary-button text to the paper colour while a more specific
+# rule painted the button background the same paper colour, so "開始轉譯" and
+# "全部取代" rendered as empty boxes. Selectors here target Streamlit 1.37's
+# `baseButton-<kind>` test ids so primary and secondary rules can't override each other.
+CAMP_THEME_CSS = """
+<style>
+:root {
+    --camp-bg: #F4EFE4;
+    --camp-bg-secondary: #E8DFCB;
+    --camp-surface: #FFFDF8;
+    --camp-surface-sunk: #F8F3E8;
+    --camp-border: #D9CCB0;
+    --camp-border-strong: #B9A57E;
+    --camp-text: #2E2920;
+    --camp-text-muted: #5F5645;
+    --camp-text-faint: #857A64;
+    --camp-moss: #5F6C44;
+    --camp-moss-dark: #4A5534;
+    --camp-moss-soft: #E3E9D3;
+    --camp-moss-ink: #3B4626;
+    --camp-amber-soft: #F5E7C6;
+    --camp-amber-ink: #6A4A0E;
+    --camp-rust: #A2522F;
+    --camp-rust-soft: #F4DDD1;
+    --camp-rust-ink: #7A3418;
+    --camp-sky-soft: #DDE8EA;
+    --camp-sky-ink: #2C4A52;
+    --camp-neutral-soft: #ECE5D6;
+    --camp-neutral-ink: #4A4335;
+    --camp-disabled-bg: #EEE7D8;
+    --camp-disabled-text: #766C58;
+}
+
+/* ---------- Page ---------- */
+h1, h2, h3, h4 { color: var(--camp-text); font-weight: 650; }
+hr { background-color: var(--camp-border); }
+[data-testid="stHeader"] { background-color: transparent; }
+[data-testid="stDeployButton"] { display: none; }
+[data-testid="stAppViewBlockContainer"] { max-width: 1240px; padding-top: 2.4rem; }
+
+[data-testid="stSidebar"] {
+    background-color: var(--camp-bg-secondary);
+    border-right: 1px solid var(--camp-border-strong);
+}
+[data-testid="stSidebarUserContent"] { padding-top: 1rem; }
+
+/* ---------- Text ---------- */
+[data-testid="stCaptionContainer"],
+[data-testid="stCaptionContainer"] p { color: var(--camp-text-muted) !important; }
+[data-testid="stWidgetLabel"] p { color: var(--camp-text); font-weight: 550; }
+[data-testid="stMarkdownContainer"] code {
+    color: var(--camp-moss-ink);
+    background-color: var(--camp-neutral-soft);
+    border: 1px solid var(--camp-border);
+    border-radius: 4px;
+    padding: 0.05em 0.35em;
+    font-size: 0.86em;
+    word-break: break-all;
+}
+
+/* ---------- Buttons ---------- */
+button[data-testid="baseButton-secondary"],
+button[data-testid="baseButton-secondaryFormSubmit"] {
+    border-radius: 8px;
+    border: 1px solid var(--camp-border-strong);
+    background-color: var(--camp-surface);
+    color: var(--camp-text);
+}
+button[data-testid="baseButton-secondary"]:hover,
+button[data-testid="baseButton-secondaryFormSubmit"]:hover {
+    border-color: var(--camp-moss);
+    background-color: var(--camp-moss-soft);
+    color: var(--camp-moss-ink);
+}
+button[data-testid="baseButton-primary"],
+button[data-testid="baseButton-primaryFormSubmit"] {
+    border-radius: 8px;
+    border: 1px solid var(--camp-moss);
+    background-color: var(--camp-moss);
+    color: #FFFFFF;
+    font-weight: 600;
+}
+button[data-testid="baseButton-primary"] *,
+button[data-testid="baseButton-primaryFormSubmit"] * { color: #FFFFFF; }
+button[data-testid="baseButton-primary"]:hover,
+button[data-testid="baseButton-primaryFormSubmit"]:hover {
+    border-color: var(--camp-moss-dark);
+    background-color: var(--camp-moss-dark);
+    color: #FFFFFF;
+}
+button[data-testid="baseButton-secondary"]:focus-visible,
+button[data-testid="baseButton-secondaryFormSubmit"]:focus-visible,
+button[data-testid="baseButton-primary"]:focus-visible,
+button[data-testid="baseButton-primaryFormSubmit"]:focus-visible {
+    box-shadow: 0 0 0 3px rgba(95, 108, 68, 0.35);
+}
+/* Disabled stays legible (4.2:1) but reads as inactive: dashed border, no fill colour. */
+button[data-testid="baseButton-secondary"]:disabled,
+button[data-testid="baseButton-secondaryFormSubmit"]:disabled,
+button[data-testid="baseButton-primary"]:disabled,
+button[data-testid="baseButton-primaryFormSubmit"]:disabled,
+button[data-testid="baseButton-secondary"]:disabled *,
+button[data-testid="baseButton-secondaryFormSubmit"]:disabled *,
+button[data-testid="baseButton-primary"]:disabled *,
+button[data-testid="baseButton-primaryFormSubmit"]:disabled * {
+    color: var(--camp-disabled-text) !important;
+}
+button[data-testid="baseButton-secondary"]:disabled,
+button[data-testid="baseButton-secondaryFormSubmit"]:disabled,
+button[data-testid="baseButton-primary"]:disabled,
+button[data-testid="baseButton-primaryFormSubmit"]:disabled {
+    background-color: var(--camp-disabled-bg) !important;
+    border: 1px dashed var(--camp-border-strong) !important;
+    cursor: not-allowed;
+}
+
+[data-testid="stNumberInput"] button {
+    background-color: var(--camp-bg-secondary);
+    color: var(--camp-text);
+}
+[data-testid="stNumberInput"] button:hover:not(:disabled) {
+    background-color: var(--camp-moss);
+    color: #FFFFFF;
+}
+[data-testid="stNumberInput"] button:disabled { color: var(--camp-disabled-text); }
+[data-testid="stNumberInput"] button svg { fill: currentColor; }
+
+/* ---------- Inputs ---------- */
+[data-baseweb="input"],
+[data-baseweb="textarea"],
+[data-baseweb="select"] > div {
+    border-radius: 6px !important;
+    border-color: var(--camp-border-strong) !important;
+    background-color: var(--camp-surface) !important;
+}
+[data-baseweb="base-input"],
+[data-testid="stTextInput"] input,
+[data-testid="stNumberInput"] input,
+[data-testid="stTextArea"] textarea {
+    background-color: var(--camp-surface) !important;
+    color: var(--camp-text);
+}
+[data-baseweb="input"]:focus-within,
+[data-baseweb="textarea"]:focus-within {
+    border-color: var(--camp-moss) !important;
+    box-shadow: 0 0 0 1px var(--camp-moss) !important;
+}
+input::placeholder, textarea::placeholder {
+    color: var(--camp-text-faint) !important;
+    opacity: 1;
+}
+/* Read-only text areas (the prompt preview) used to fade to light grey. */
+[data-testid="stTextArea"] textarea:disabled {
+    color: var(--camp-text) !important;
+    -webkit-text-fill-color: var(--camp-text) !important;
+    background-color: var(--camp-surface-sunk) !important;
+    cursor: default;
+}
+
+/* Input-mode switchers (the app's only radio groups), drawn as pill buttons. */
+[data-testid="stRadio"] [role="radiogroup"] { gap: 0.5rem; flex-wrap: wrap; }
+[data-testid="stRadio"] [role="radiogroup"] > label {
+    margin: 0 !important;
+    padding: 0.4rem 0.95rem 0.4rem 0.65rem;
+    border: 1px solid var(--camp-border-strong);
+    border-radius: 999px;
+    background-color: var(--camp-surface);
+}
+[data-testid="stRadio"] [role="radiogroup"] > label:hover { border-color: var(--camp-moss); }
+[data-testid="stRadio"] [role="radiogroup"] > label:has(input:checked) {
+    border-color: var(--camp-moss);
+    background-color: var(--camp-moss-soft);
+}
+[data-testid="stRadio"] [role="radiogroup"] > label:has(input:checked) p {
+    color: var(--camp-moss-ink);
+    font-weight: 650;
+}
+
+/* ---------- Surfaces ---------- */
+/* Only bordered containers become cards. Streamlit 1.37 gives every unbordered block
+   wrapper the empty-style class st-emotion-cache-0; painting those too turned the whole
+   main column and the top of the sidebar into one big white slab. If a future Streamlit
+   renames that class, the cards simply lose their fill and stay readable. */
+div[data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) {
+    border-color: var(--camp-border) !important;
+    border-radius: 10px !important;
+    background-color: var(--camp-surface);
+}
+[data-testid="stForm"] {
+    border-color: var(--camp-border) !important;
+    border-radius: 10px;
+    background-color: var(--camp-surface);
+}
+[data-testid="stExpander"] details {
+    border: 1px solid var(--camp-border);
+    border-radius: 10px;
+    background-color: var(--camp-surface);
+}
+[data-testid="stExpander"] summary p { font-weight: 600; color: var(--camp-text); }
+[data-testid="stExpander"] summary:hover p { color: var(--camp-moss-dark); }
+
+[data-testid="stMetric"] {
+    background-color: var(--camp-surface);
+    border: 1px solid var(--camp-border);
+    border-radius: 10px;
+    padding: 0.55rem 0.85rem 0.6rem;
+}
+[data-testid="stMetricLabel"] p { color: var(--camp-text-muted) !important; font-size: 0.82rem !important; }
+[data-testid="stMetricValue"] { font-size: 1.45rem !important; color: var(--camp-text); }
+
+[data-baseweb="tab-list"] { gap: 0.25rem; }
+[data-baseweb="tab"] { padding: 0.45rem 0.9rem !important; border-radius: 8px 8px 0 0; }
+[data-baseweb="tab"] p { font-size: 0.98rem !important; font-weight: 600; color: var(--camp-text-muted); }
+[data-baseweb="tab"]:hover p { color: var(--camp-text); }
+[data-baseweb="tab"][aria-selected="true"] { background-color: var(--camp-surface); }
+[data-baseweb="tab"][aria-selected="true"] p { color: var(--camp-moss-dark); }
+[data-baseweb="tab-highlight"] { background-color: var(--camp-moss) !important; height: 3px !important; }
+[data-baseweb="tab-border"] { background-color: var(--camp-border) !important; }
+
+[data-testid="stFileUploaderDropzone"] {
+    background-color: var(--camp-surface);
+    border: 1.5px dashed var(--camp-border-strong);
+    border-radius: 10px;
+}
+[data-testid="stFileUploaderDropzone"]:hover { border-color: var(--camp-moss); }
+[data-testid="stFileUploaderDropzoneInstructions"] span,
+[data-testid="stFileUploaderDropzoneInstructions"] small { color: var(--camp-text-muted) !important; }
+
+[data-testid="stDataFrame"] {
+    border: 1px solid var(--camp-border);
+    border-radius: 8px;
+    overflow: hidden;
+}
+/* st.divider is only used between queue rows; its default 2rem margins split the list apart. */
+[data-testid="stMarkdownContainer"] hr { margin: 0.15rem 0 !important; }
+
+/* Plain-text view: wrap long lines, keep the copy button pinned above the scroll area. */
+[data-testid="stCodeBlock"] pre {
+    max-height: 460px;
+    overflow: auto;
+    background-color: var(--camp-surface-sunk) !important;
+    border: 1px solid var(--camp-border);
+    border-radius: 8px;
+}
+[data-testid="stCodeBlock"] code {
+    white-space: pre-wrap !important;
+    word-break: break-word;
+    font-family: "Source Sans Pro", sans-serif !important;
+    font-size: 0.95rem !important;
+    line-height: 1.75;
+    color: var(--camp-text) !important;
+}
+
+/* ---------- App components ---------- */
+.tsr-hero {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem 1.5rem;
+    padding: 1.1rem 1.3rem;
+    background-color: var(--camp-surface);
+    border: 1px solid var(--camp-border);
+    border-left: 5px solid var(--camp-moss);
+    border-radius: 12px;
+}
+.tsr-hero-title { font-size: 1.6rem; font-weight: 700; color: var(--camp-text); line-height: 1.25; }
+.tsr-hero-sub { margin-top: 0.25rem; font-size: 0.92rem; color: var(--camp-text-muted); }
+
+.tsr-step {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin: 1.9rem 0 0.35rem;
+    padding-bottom: 0.55rem;
+    border-bottom: 1px solid var(--camp-border);
+    scroll-margin-top: 4rem;
+}
+.tsr-step-num {
+    flex: none;
+    width: 2rem;
+    height: 2rem;
+    border-radius: 50%;
+    background-color: var(--camp-moss);
+    color: #FFFFFF;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.tsr-step-title { font-size: 1.3rem; font-weight: 700; color: var(--camp-text); line-height: 1.3; }
+.tsr-step-hint { font-size: 0.88rem; color: var(--camp-text-muted); line-height: 1.4; }
+.tsr-step-badge { margin-left: auto; display: flex; gap: 0.35rem; flex-wrap: wrap; justify-content: flex-end; }
+.tsr-subhead {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+    font-size: 1.08rem;
+    font-weight: 700;
+    color: var(--camp-text);
+    margin: 0.1rem 0 0.2rem;
+    word-break: break-all;
+}
+
+.tsr-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.08rem 0.6rem;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    font-size: 0.8rem;
+    font-weight: 650;
+    line-height: 1.55;
+    white-space: nowrap;
+}
+.tsr-pill.moss { background-color: var(--camp-moss-soft); color: var(--camp-moss-ink); border-color: #C6D1AE; }
+.tsr-pill.amber { background-color: var(--camp-amber-soft); color: var(--camp-amber-ink); border-color: #E6CF96; }
+.tsr-pill.rust { background-color: var(--camp-rust-soft); color: var(--camp-rust-ink); border-color: #E3B9A5; }
+.tsr-pill.sky { background-color: var(--camp-sky-soft); color: var(--camp-sky-ink); border-color: #B9CDD1; }
+.tsr-pill.neutral { background-color: var(--camp-neutral-soft); color: var(--camp-neutral-ink); border-color: var(--camp-border); }
+
+.tsr-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 0.1rem 0 0.5rem; }
+.tsr-chip {
+    display: inline-flex;
+    gap: 0.4rem;
+    align-items: baseline;
+    padding: 0.28rem 0.65rem;
+    background-color: var(--camp-surface);
+    border: 1px solid var(--camp-border);
+    border-radius: 8px;
+    font-size: 0.86rem;
+    color: var(--camp-text);
+}
+.tsr-chip b { color: var(--camp-text-muted); font-weight: 600; }
+.tsr-chip.warn { background-color: var(--camp-amber-soft); border-color: #E6CF96; color: var(--camp-amber-ink); }
+.tsr-chip.warn b { color: var(--camp-amber-ink); }
+
+.tsr-file { font-weight: 650; color: var(--camp-text); word-break: break-all; line-height: 1.4; }
+.tsr-path { font-size: 0.8rem; color: var(--camp-text-muted); word-break: break-all; line-height: 1.35; }
+.tsr-range { font-size: 0.86rem; color: var(--camp-text); font-variant-numeric: tabular-nums; line-height: 1.5; }
+.tsr-range span { color: var(--camp-text-muted); }
+.tsr-error {
+    margin-top: 0.3rem;
+    padding: 0.3rem 0.55rem;
+    border-radius: 6px;
+    background-color: var(--camp-rust-soft);
+    color: var(--camp-rust-ink);
+    font-size: 0.84rem;
+    word-break: break-word;
+}
+.tsr-empty {
+    padding: 0.95rem 1.15rem;
+    border: 1.5px dashed var(--camp-border-strong);
+    border-radius: 10px;
+    background-color: rgba(255, 253, 248, 0.6);
+    color: var(--camp-text-muted);
+    font-size: 0.92rem;
+}
+.tsr-empty b { color: var(--camp-text); }
+
+.tsr-nav {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    padding: 0.45rem;
+    background-color: var(--camp-surface);
+    border: 1px solid var(--camp-border);
+    border-radius: 10px;
+}
+.tsr-nav-title {
+    padding: 0.1rem 0.45rem 0.25rem;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--camp-text-muted);
+}
+.tsr-nav a, .tsr-nav .off {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.3rem 0.45rem;
+    border-radius: 7px;
+    color: var(--camp-text) !important;
+    text-decoration: none !important;
+    font-size: 0.9rem;
+}
+.tsr-nav a:hover { background-color: var(--camp-moss-soft); }
+.tsr-nav .off { color: var(--camp-disabled-text) !important; }
+.tsr-nav .n {
+    flex: none;
+    width: 1.35rem;
+    height: 1.35rem;
+    border-radius: 50%;
+    background-color: var(--camp-neutral-soft);
+    border: 1px solid var(--camp-border);
+    color: var(--camp-neutral-ink);
+    font-size: 0.75rem;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.tsr-nav .done .n { background-color: var(--camp-moss); border-color: var(--camp-moss); color: #FFFFFF; }
+.tsr-nav .c { margin-left: auto; font-size: 0.78rem; color: var(--camp-text-muted); white-space: nowrap; }
+
+.subtitle-page-progress {
+    min-height: 2.45rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: var(--camp-text);
+    line-height: 1.25;
+}
+.subtitle-page-progress span {
+    color: var(--camp-text-muted);
+    font-size: 0.82rem;
+}
+</style>
+"""
+st.markdown(CAMP_THEME_CSS, unsafe_allow_html=True)
+
 TEMP_DIR = Path("temp_uploads")
 OUTPUT_DIR = Path("outputs")
 MODEL_DIR = Path("models")
@@ -72,11 +504,20 @@ RULES_PATH = Path("replacements.json")
 RULES_OPEN_KEY = "rules_panel_open"
 ADVANCED_OPEN_KEY = "advanced_panel_open"
 STATUS_LABELS = {"pending": "待轉譯", "running": "轉譯中", "done": "完成", "error": "失敗"}
-UPLOAD_MODE = "拖曳上傳檔案（限制由系統設定）"
-PATH_MODE = "直接輸入電腦中的檔案路徑（無大小限制，最快）"
-SUBTITLE_MODE = "匯入現有字幕檔（SRT／VTT，直接編輯）"
+STATUS_TONES = {"pending": "sky", "running": "amber", "done": "moss", "error": "rust"}
+UPLOAD_MODE = "上傳影片／音檔"
+PATH_MODE = "輸入檔案路徑（最快、無大小限制）"
+SUBTITLE_MODE = "匯入現有字幕（SRT／VTT）"
+INPUT_MODE_HINTS = {
+    UPLOAD_MODE: "從瀏覽器上傳，適合較小的檔案。上傳的檔案沒有原始位置可寫回，字幕會存到 outputs/；"
+    "大型影片建議改用「輸入檔案路徑」。",
+    PATH_MODE: "直接讀取這台電腦上的檔案，不經過瀏覽器上傳，字幕預設存回影片旁邊。",
+    SUBTITLE_MODE: "匯入以前轉好的字幕，直接套用取代規則、修改文字後存回原檔。"
+    "不需要影片，但也因此無法逐段試聽。",
+}
 SUBTITLE_SUFFIXES = (".srt", ".vtt")
 OUTPUT_FORMATS = ["txt", "vtt", "srt", "tsv", "json"]
+SUBTITLE_ROWS_PER_PAGE = 10
 MODEL_OPTIONS = {
     "快速｜Turbo（建議先試）": "turbo",
     "平衡｜Medium": "medium",
@@ -119,6 +560,48 @@ CHINESE_OUTPUT_OPTIONS = {
     "標準繁體": "s2t",
     "保留 Whisper 原文": None,
 }
+ENGINE_SHORT_NAMES = {
+    ENGINE_BREEZE: "Breeze ASR 25",
+    ENGINE_WHISPER: "Whisper",
+    ENGINE_SENSEVOICE: "SenseVoice-small",
+}
+ENGINE_NOTES = {
+    ENGINE_BREEZE: "台灣華語與中英夾雜最準，直接輸出繁體。不使用詞庫提示，固定用詞請靠取代規則修正。",
+    ENGINE_WHISPER: "唯一會使用詞庫提示的引擎。模型越大越準也越慢，可先用 Turbo 試。",
+    ENGINE_SENSEVOICE: "最輕量、推論最快。中英混合時語言請選「自動偵測」。不使用詞庫提示。",
+}
+
+
+def esc(value) -> str:
+    return html.escape(str(value))
+
+
+def pill(text: str, tone: str = "neutral") -> str:
+    return f"<span class='tsr-pill {tone}'>{esc(text)}</span>"
+
+
+def chip(label: str, value: str, warn: bool = False) -> str:
+    css = "tsr-chip warn" if warn else "tsr-chip"
+    return f"<span class='{css}'><b>{esc(label)}</b>{esc(value)}</span>"
+
+
+def render_html(markup: str, target=None) -> None:
+    """Emit one line of trusted markup. Interpolated values must already be escaped."""
+    (target or st).markdown(markup, unsafe_allow_html=True)
+
+
+def step_header(number: int, title: str, hint: str = "", badges: str = "") -> None:
+    """Numbered section heading; the id is what the sidebar's step links jump to."""
+    hint_html = f"<div class='tsr-step-hint'>{esc(hint)}</div>" if hint else ""
+    render_html(
+        f"<div class='tsr-step' id='step-{number}'><span class='tsr-step-num'>{number}</span>"
+        f"<div><div class='tsr-step-title'>{esc(title)}</div>{hint_html}</div>"
+        f"<div class='tsr-step-badge'>{badges}</div></div>"
+    )
+
+
+def empty_state(markup: str) -> None:
+    render_html(f"<div class='tsr-empty'>{markup}</div>")
 
 
 @st.cache_resource(show_spinner=False, max_entries=1)
@@ -371,7 +854,13 @@ def rule_add_from_inputs(find_key: str, replace_key: str) -> None:
     )
 
 
-def apply_replacement(record: dict, search_key: str, replace_key: str, notice_key: str) -> None:
+def apply_replacement(
+    record: dict,
+    search_key: str,
+    replace_key: str,
+    notice_key: str,
+    editor_version_key: str,
+) -> None:
     """Replace across all segments, then clear the find/replace pair.
 
     Runs as a widget callback so the two text inputs can be reset: after a replacement the
@@ -385,6 +874,8 @@ def apply_replacement(record: dict, search_key: str, replace_key: str, notice_ke
         st.session_state[notice_key] = (0, "", replacement, False, 0)
         return
     changed = replace_across_segments(record, search, replacement)
+    if changed:
+        st.session_state[editor_version_key] = st.session_state.get(editor_version_key, 0) + 1
     saved = False
     if changed and st.session_state.get(f"{search_key}_save_rule"):
         add_rule(get_rules(), search, replacement)
@@ -405,14 +896,70 @@ def apply_replacement(record: dict, search_key: str, replace_key: str, notice_ke
     st.session_state[notice_key] = (changed, search, replacement, saved, near_misses)
 
 
-def clear_subtitle_filters(search_key: str, dense_key: str) -> None:
+def clear_subtitle_filters(search_key: str, dense_key: str, page_key: str) -> None:
     st.session_state[search_key] = ""
     st.session_state[dense_key] = False
+    st.session_state[page_key] = 1
 
 
-def apply_saved_rules(record: dict, notice_key: str) -> None:
+def apply_saved_rules(record: dict, notice_key: str, editor_version_key: str) -> None:
     changed, hits = apply_replacement_rules(record, active_rules(get_rules()))
+    if changed:
+        st.session_state[editor_version_key] = st.session_state.get(editor_version_key, 0) + 1
     st.session_state[notice_key] = (changed, {f: n for f, n in hits.items() if n})
+
+
+def set_subtitle_page(
+    page_key: str,
+    page: int,
+    total_pages: int,
+    target_key: str | None = None,
+    target_segment: int | None = None,
+) -> None:
+    st.session_state[page_key] = max(1, min(int(page), total_pages))
+    if target_key is not None and target_segment is not None:
+        st.session_state[target_key] = int(target_segment)
+
+
+def jump_to_subtitle_segment(
+    page_key: str,
+    target_key: str,
+    search_filter_key: str,
+    dense_key: str,
+    total_segments: int,
+    notice_key: str,
+) -> None:
+    target = max(1, min(int(st.session_state.get(target_key, 1)), total_segments))
+    filters_cleared = bool(st.session_state.get(search_filter_key)) or bool(
+        st.session_state.get(dense_key)
+    )
+    st.session_state[search_filter_key] = ""
+    st.session_state[dense_key] = False
+    st.session_state[page_key] = (target - 1) // SUBTITLE_ROWS_PER_PAGE + 1
+    st.session_state[notice_key] = (target, filters_cleared)
+
+
+def save_subtitle_editor_delta(
+    record: dict,
+    editor_key: str,
+    visible_rows: list[dict],
+    editor_version_key: str,
+    notice_key: str,
+) -> None:
+    changed_rows = editor_rows_from_delta(visible_rows, st.session_state.get(editor_key))
+    changed = update_result_from_editor(record, changed_rows)
+    if not changed:
+        return
+    st.session_state[editor_version_key] = st.session_state.get(editor_version_key, 0) + 1
+    numbers = [int(row["段落"]) for row in changed_rows]
+    st.session_state[notice_key] = (changed, min(numbers), max(numbers))
+
+
+def restore_subtitles(record: dict, editor_version_key: str, notice_key: str) -> None:
+    changed = restore_original_text(record)
+    if changed:
+        st.session_state[editor_version_key] = st.session_state.get(editor_version_key, 0) + 1
+    st.session_state[notice_key] = changed
 
 
 @st.fragment
@@ -432,7 +979,10 @@ def glossary_panel(prompt_supported: bool = True) -> None:
 
     # The counts live out here because Streamlit resets an expander's open state whenever
     # its label changes, and the label would change on every single add or removal.
-    st.caption(f"詞庫啟用 {len(enabled)} 個 / 共 {total} 個")
+    status = chip("專有名詞詞庫", f"啟用 {len(enabled)} / 共 {total} 個")
+    if not prompt_supported:
+        status += chip("目前引擎", "不使用詞庫提示（僅 Whisper 適用）", warn=True)
+    render_html(f"<div class='tsr-chips'>{status}</div>")
     with st.expander("📚 管理專有名詞詞庫", expanded=st.session_state[GLOSSARY_OPEN_KEY]):
         st.caption(
             "詞庫會存進 glossary.json，關掉程式也不會消失。啟用的詞會在轉譯時當作提示，"
@@ -464,7 +1014,7 @@ def glossary_panel(prompt_supported: bool = True) -> None:
 
         with available_column:
             st.markdown(f"**詞庫（未啟用）｜{len(available)}**")
-            st.caption("點擊詞可加入本次轉譯，🗑 會從詞庫永久刪除。")
+            st.caption("點擊詞可加入本次轉譯，「刪除」會從詞庫永久移除。")
             add_key = "glossary_add_input"
             input_column, button_column = st.columns([3, 1])
             input_column.text_input(
@@ -495,7 +1045,7 @@ def glossary_panel(prompt_supported: bool = True) -> None:
                 elif not matches:
                     st.caption("沒有符合搜尋的詞。")
                 for term in matches:
-                    add_column, delete_column = st.columns([6, 1], gap="small")
+                    add_column, delete_column = st.columns([5, 1.4], gap="small")
                     add_column.button(
                         f"＋ {term}",
                         key=term_key("gloss_on", term),
@@ -504,7 +1054,8 @@ def glossary_panel(prompt_supported: bool = True) -> None:
                         args=(term,),
                     )
                     delete_column.button(
-                        "🗑",
+                        "刪除",
+                        use_container_width=True,
                         key=term_key("gloss_del", term),
                         help=f"從詞庫永久刪除「{term}」",
                         on_click=glossary_delete,
@@ -562,7 +1113,10 @@ def rules_panel() -> None:
     if RULES_OPEN_KEY not in st.session_state:
         st.session_state[RULES_OPEN_KEY] = not rules
 
-    st.caption(f"取代規則啟用 {len(enabled)} 條 / 共 {len(rules)} 條")
+    status = chip("常用取代規則", f"啟用 {len(enabled)} / 共 {len(rules)} 條")
+    if enabled:
+        status += chip("轉譯完成時", "自動套用，所有引擎都有效")
+    render_html(f"<div class='tsr-chips'>{status}</div>")
     with st.expander("🔁 管理常用取代規則", expanded=st.session_state[RULES_OPEN_KEY]):
         st.caption(
             "規則存進 replacements.json，關掉程式也不會消失。這些規則是在轉譯完成後套用到文字上，"
@@ -594,7 +1148,7 @@ def rules_panel() -> None:
                 st.caption("尚未建立任何取代規則。")
             for entry in rules:
                 find = entry["find"]
-                toggle_column, text_column, delete_column = st.columns([1, 8, 1])
+                toggle_column, text_column, delete_column = st.columns([0.7, 8, 1.3])
                 checkbox_key = term_key("rule_on", find)
                 toggle_column.checkbox(
                     "啟用",
@@ -607,7 +1161,8 @@ def rules_panel() -> None:
                 shown = entry["replace"] or "（刪除）"
                 text_column.markdown(f"`{find}` → `{shown}`")
                 delete_column.button(
-                    "🗑",
+                    "刪除",
+                    use_container_width=True,
                     key=term_key("rule_del", find),
                     help=f"刪除規則「{find}」",
                     on_click=rule_delete,
@@ -728,7 +1283,8 @@ def waveform_figure(times, amplitudes, selected_range: tuple[float, float], dura
             y=amplitudes,
             mode="lines",
             fill="tozeroy",
-            line={"color": "#4f8bf9", "width": 1},
+            line={"color": "#5F6C44", "width": 1},
+            fillcolor="rgba(95, 108, 68, 0.32)",
             customdata=hover_times,
             hovertemplate="時間 %{customdata}<extra></extra>",
         )
@@ -736,43 +1292,69 @@ def waveform_figure(times, amplitudes, selected_range: tuple[float, float], dura
     figure.add_vrect(
         x0=selected_range[0],
         x1=selected_range[1],
-        fillcolor="#ffb347",
-        opacity=0.18,
-        line_width=0,
-        line_color="#ff9800",
+        fillcolor="#B37B52",
+        opacity=0.12,
+        line_width=1,
+        line_color="#9C6740",
     )
     if selected_range[0] > 0:
-        figure.add_vrect(x0=0, x1=selected_range[0], fillcolor="#111827", opacity=0.42, line_width=0)
+        figure.add_vrect(x0=0, x1=selected_range[0], fillcolor="#2E2920", opacity=0.35, line_width=0)
     if selected_range[1] < duration:
-        figure.add_vrect(x0=selected_range[1], x1=duration, fillcolor="#111827", opacity=0.42, line_width=0)
+        figure.add_vrect(x0=selected_range[1], x1=duration, fillcolor="#2E2920", opacity=0.35, line_width=0)
+    # The labels get their own paper-coloured box: drawn straight on the plot they sat on
+    # top of the waveform and the dimmed overlay and were hard to read.
+    marker_label = {
+        "annotation_bgcolor": "rgba(255, 253, 248, 0.95)",
+        "annotation_borderpad": 3,
+        "annotation_font_size": 12,
+    }
     figure.add_vline(
         x=selected_range[0],
-        line_color="#22c55e",
+        line_color="#4A5534",
         line_width=3,
         annotation_text=f"A  {format_hhmmss(selected_range[0])}",
         annotation_position="top right",
+        annotation_font_color="#3B4626",
+        annotation_bordercolor="#4A5534",
+        **marker_label,
     )
     figure.add_vline(
         x=selected_range[1],
-        line_color="#ef4444",
+        line_color="#A2522F",
         line_width=3,
         annotation_text=f"B  {format_hhmmss(selected_range[1])}",
         annotation_position="top left",
+        annotation_font_color="#7A3418",
+        annotation_bordercolor="#A2522F",
+        **marker_label,
     )
     figure.update_layout(
-        height=340,
-        margin={"l": 10, "r": 10, "t": 45, "b": 55},
+        height=300,
+        margin={"l": 10, "r": 10, "t": 40, "b": 50},
         dragmode="select",
         selectdirection="h",
         showlegend=False,
+        paper_bgcolor="#FFFDF8",
+        plot_bgcolor="#FFFDF8",
+        font={"color": "#2E2920"},
         xaxis={
             "title": "原影片時間（HH:MM:SS）",
             "fixedrange": True,
             "tickmode": "array",
             "tickvals": tick_values,
             "ticktext": tick_labels,
+            "gridcolor": "#EAE2CF",
+            "linecolor": "#B9A57E",
+            "zerolinecolor": "#B9A57E",
         },
-        yaxis={"title": "音量", "range": [0, 1.02], "fixedrange": True},
+        yaxis={
+            "title": "音量",
+            "range": [0, 1.02],
+            "fixedrange": True,
+            "gridcolor": "#EAE2CF",
+            "linecolor": "#B9A57E",
+            "zerolinecolor": "#B9A57E",
+        },
     )
     return figure
 
@@ -873,11 +1455,22 @@ def get_queue() -> list[dict]:
     return st.session_state.queue
 
 
+def queue_view() -> list[dict]:
+    """Queue entries the queue table shows. Archived ones live on only in the results."""
+    return [job for job in get_queue() if not job.get("archived")]
+
+
+def already_queued(resolved: str) -> bool:
+    # Archived entries don't count: they are invisible in the queue, so refusing to re-add
+    # their file would report "already queued" for something the user can't see.
+    return any(job["path"] == resolved for job in queue_view())
+
+
 def enqueue_media(path: Path, *, is_temp: bool) -> str | None:
     """Add one file to the queue. Returns an error string, or None on success."""
     queue = get_queue()
     resolved = str(path.resolve())
-    if any(job["path"] == resolved for job in queue):
+    if already_queued(resolved):
         return f"{path.name}：已在佇列中"
     try:
         duration = probe_duration(path)
@@ -918,7 +1511,7 @@ def enqueue_subtitle(path: Path, *, is_temp: bool) -> str | None:
     """Import an existing subtitle straight into the results area for re-editing."""
     queue = get_queue()
     resolved = str(path.resolve())
-    if any(job["path"] == resolved for job in queue):
+    if already_queued(resolved):
         return f"{path.name}：已在佇列中"
     try:
         result = parse_srt(read_text_guess(path))
@@ -975,7 +1568,14 @@ def remove_job(job_id: str) -> None:
 
 
 def clear_finished_jobs() -> None:
-    st.session_state.queue = [job for job in get_queue() if job["status"] != "done"]
+    """Hide finished entries from the queue table while keeping their results.
+
+    This used to drop them from the queue outright, but the results area is built from
+    the queue, so the button labelled "results stay below" deleted every result.
+    """
+    for job in get_queue():
+        if job["status"] == "done":
+            job["archived"] = True
 
 
 def requeue_job(job_id: str) -> None:
@@ -987,6 +1587,10 @@ def requeue_job(job_id: str) -> None:
 
 def focus_job(job_id: str) -> None:
     st.session_state.focused_job = job_id
+
+
+def unfocus_job() -> None:
+    st.session_state.pop("focused_job", None)
 
 
 def transcribe_job(job: dict, settings: dict, device: str) -> dict:
@@ -1180,38 +1784,80 @@ def subtitle_editor(record: dict, input_path: Path) -> None:
     dense_key = f"subtitle_dense_only_{record['id']}"
     notice_key = f"subtitle_replace_notice_{record['id']}"
     rules_notice_key = f"subtitle_rules_notice_{record['id']}"
+    page_key = f"subtitle_page_{record['id']}"
+    jump_key = f"subtitle_jump_{record['id']}"
+    jump_notice_key = f"subtitle_jump_notice_{record['id']}"
+    editor_version_key = f"subtitle_editor_version_{record['id']}"
+    edit_notice_key = f"subtitle_edit_notice_{record['id']}"
+    revert_notice_key = f"subtitle_revert_notice_{record['id']}"
+    st.session_state.setdefault(page_key, 1)
+    st.session_state.setdefault(editor_version_key, 0)
 
     # Find/replace and the table filter each live in their own form. Widgets inside a form
     # do not trigger a rerun when they change, so tabbing between 尋找 and 取代為 or ticking
     # a checkbox no longer re-renders the panel mid-edit — which is what made the layout
     # jump and briefly drop controls. Nothing reruns until a submit button is pressed.
-    with st.form(f"subtitle_replace_form_{record['id']}", border=True):
-        st.markdown("**尋找與取代**（會套用到整份字幕，不受下方篩選影響）")
-        find_column, to_column = st.columns(2)
-        find_column.text_input(
-            "尋找文字",
-            key=search_key,
-            placeholder="要修正的字，需與原文大小寫一致",
-        )
-        to_column.text_input(
-            "取代為",
-            key=replace_key,
-            placeholder="留空表示刪除這段文字",
-        )
-        save_column, submit_column = st.columns([3, 2])
-        save_column.checkbox(
-            "取代後存成常用規則",
-            key=f"{search_key}_save_rule",
-            help="勾選後按「全部取代」，這組尋找／取代會存進 replacements.json 重複使用。",
-        )
-        with submit_column:
-            st.write("")
-            st.form_submit_button(
+    # Side by side rather than stacked so the table starts one screen higher.
+    replace_side, filter_side = st.columns(2, gap="medium")
+    with replace_side:
+        with st.form(f"subtitle_replace_form_{record['id']}", border=True):
+            st.markdown("**尋找與取代**")
+            st.caption("套用到整份字幕，不受右側篩選影響；大小寫需完全一致。")
+            find_column, to_column = st.columns(2)
+            find_column.text_input(
+                "尋找文字",
+                key=search_key,
+                placeholder="要修正的字",
+            )
+            to_column.text_input(
+                "取代為",
+                key=replace_key,
+                placeholder="留空表示刪除這段文字",
+            )
+            save_column, submit_column = st.columns([3, 2], vertical_alignment="center")
+            save_column.checkbox(
+                "取代後存成常用規則",
+                key=f"{search_key}_save_rule",
+                help="勾選後按「全部取代」，這組尋找／取代會存進 replacements.json 重複使用。",
+            )
+            submit_column.form_submit_button(
                 "全部取代",
                 type="primary",
                 use_container_width=True,
                 on_click=apply_replacement,
-                args=(record, search_key, replace_key, notice_key),
+                args=(record, search_key, replace_key, notice_key, editor_version_key),
+            )
+
+    with filter_side:
+        with st.container(border=True):
+            st.markdown("**篩選表格**")
+            with st.form(f"subtitle_filter_form_{record['id']}", border=False):
+                st.text_input(
+                    "只顯示包含這串文字的段落",
+                    key=search_filter_key,
+                    placeholder="🔍 留空顯示全部",
+                )
+                dense_column, filter_button_column = st.columns([3, 2], vertical_alignment="center")
+                dense_column.checkbox(
+                    "只顯示偏快的段落",
+                    key=dense_key,
+                    disabled=not dense_count,
+                )
+                filter_button_column.form_submit_button(
+                    "套用篩選",
+                    use_container_width=True,
+                    on_click=set_subtitle_page,
+                    args=(page_key, 1, 1),
+                )
+            saved_rules = active_rules(get_rules())
+            st.button(
+                f"重新套用儲存的取代規則（{len(saved_rules)} 條）",
+                key=f"subtitle_apply_rules_{record['id']}",
+                disabled=not saved_rules,
+                use_container_width=True,
+                help="對整份字幕再跑一次第 3 步裡啟用中的取代規則。",
+                on_click=apply_saved_rules,
+                args=(record, rules_notice_key, editor_version_key),
             )
 
     if notice := st.session_state.pop(notice_key, None):
@@ -1230,35 +1876,6 @@ def subtitle_editor(record: dict, input_path: Path) -> None:
         else:
             st.info(f"沒有段落包含「{replaced}」，未做任何變更。")
 
-    filter_row = st.container(border=True)
-    with filter_row:
-        rules_column, apply_column = st.columns([3, 2])
-        saved_rules = active_rules(get_rules())
-        rules_column.caption(f"已儲存 {len(saved_rules)} 條啟用中的取代規則")
-        apply_column.button(
-            f"套用儲存的規則（{len(saved_rules)}）",
-            key=f"subtitle_apply_rules_{record['id']}",
-            disabled=not saved_rules,
-            use_container_width=True,
-            on_click=apply_saved_rules,
-            args=(record, rules_notice_key),
-        )
-        with st.form(f"subtitle_filter_form_{record['id']}", border=False):
-            keyword_column, dense_column, filter_button_column = st.columns([4, 3, 2])
-            keyword_column.text_input(
-                "只顯示包含這串文字的段落",
-                key=search_filter_key,
-                placeholder="🔍 留空顯示全部",
-            )
-            dense_column.checkbox(
-                "只顯示偏快的段落",
-                key=dense_key,
-                disabled=not dense_count,
-            )
-            with filter_button_column:
-                st.write("")
-                st.form_submit_button("套用篩選", use_container_width=True)
-
     search = str(st.session_state.get(search_filter_key, "")).strip()
     only_dense = bool(st.session_state.get(dense_key, False))
 
@@ -1271,6 +1888,7 @@ def subtitle_editor(record: dict, input_path: Path) -> None:
             st.info("目前啟用的規則在這份字幕裡沒有找到任何符合的文字。")
 
     rows = segment_rows(segments, search=search, only_dense=only_dense)
+    page_rows: list[dict] = []
     if not rows:
         # Deliberately not an early return: bailing out here used to remove the table, the
         # audition control and the undo button all at once, which read as the panel
@@ -1280,74 +1898,202 @@ def subtitle_editor(record: dict, input_path: Path) -> None:
             "清除篩選",
             key=f"subtitle_clear_filters_{record['id']}",
             on_click=clear_subtitle_filters,
-            args=(search_filter_key, dense_key),
+            args=(search_filter_key, dense_key, page_key),
         )
     else:
         if search or only_dense:
             st.caption(
-                f"顯示 {len(rows)} / {len(segments)} 段。"
-                "切換篩選前請先儲存修改，否則未儲存的編輯會遺失。"
+                f"顯示 {len(rows)} / {len(segments)} 段。跳到指定段落時會自動清除篩選。"
             )
-        # New widget identity per filter so pending cell edits are never mapped onto a
-        # different set of rows. Safe to key on the filter now that the filter only
-        # changes on an explicit submit rather than on every keystroke.
-        filter_token = hashlib.sha1(f"{search}|{only_dense}".encode("utf-8")).hexdigest()[:8]
-        with st.form(f"subtitle_editor_{record['id']}_{filter_token}"):
-            edited_rows = st.data_editor(
-                rows,
-                hide_index=True,
-                use_container_width=True,
-                height=min(620, 90 + 35 * len(rows)),
-                disabled=["段落", "開始", "長度", "字/秒"],
-                column_config={
-                    "段落": st.column_config.NumberColumn(width="small", help="對應原始字幕編號"),
-                    "開始": st.column_config.TextColumn(width="small"),
-                    "長度": st.column_config.NumberColumn(width="small", format="%.2f 秒"),
-                    "字/秒": st.column_config.NumberColumn(
-                        width="small",
-                        format="%.1f",
-                        help=f"超過 {FAST_SUBTITLE_CPS:.0f} 代表這段字幕偏快",
-                    ),
-                    "字幕": st.column_config.TextColumn(width="large"),
-                },
-            )
-            save_edits = st.form_submit_button("儲存字幕修改", type="primary")
-        if save_edits:
-            changed = update_result_from_editor(record, edited_rows)
-            if changed:
-                st.success(f"已更新 {changed} 個段落；下載檔會使用最新內容。")
-            else:
-                st.info("沒有偵測到變更。")
 
-    audition_column, revert_column = st.columns([3, 1])
-    with audition_column:
-        number_column, play_column = st.columns([2, 1])
-        target = number_column.number_input(
-            "試聽段落",
-            min_value=1,
-            max_value=len(segments),
-            value=int(rows[0]["段落"]) if rows else 1,
-            step=1,
-            key=f"subtitle_audition_{record['id']}",
-            label_visibility="collapsed",
+        page_rows, current_page, total_pages = paginate_rows(
+            rows,
+            st.session_state.get(page_key, 1),
+            SUBTITLE_ROWS_PER_PAGE,
         )
-        with play_column:
-            play = st.button(
-                "▶ 試聽此段",
-                key=f"subtitle_play_{record['id']}",
-                disabled=not input_path.exists(),
-                use_container_width=True,
+        st.session_state[page_key] = current_page
+        first_number = int(page_rows[0]["段落"])
+        last_number = int(page_rows[-1]["段落"])
+        if jump_key not in st.session_state:
+            st.session_state[jump_key] = first_number
+
+        st.markdown("**逐段編輯**")
+        st.caption("每頁 10 段，沒有第二層長捲軸。修改字幕後離開儲存格即自動保存，換頁也不會遺失。")
+        navigation = st.container(border=True)
+        with navigation:
+            first_column, previous_column, progress_column, next_column, last_column = st.columns(
+                [1, 1, 2.4, 1, 1]
             )
+            first_column.button(
+                "⇤ 第一頁",
+                key=f"subtitle_first_{record['id']}",
+                disabled=current_page == 1,
+                use_container_width=True,
+                on_click=set_subtitle_page,
+                args=(page_key, 1, total_pages, jump_key, int(rows[0]["段落"])),
+            )
+            previous_column.button(
+                "← 上一頁",
+                key=f"subtitle_previous_{record['id']}",
+                disabled=current_page == 1,
+                use_container_width=True,
+                on_click=set_subtitle_page,
+                args=(
+                    page_key,
+                    current_page - 1,
+                    total_pages,
+                    jump_key,
+                    int(rows[max(0, (current_page - 2) * SUBTITLE_ROWS_PER_PAGE)]["段落"]),
+                ),
+            )
+            progress_column.markdown(
+                f"<div class='subtitle-page-progress'><strong>第 {current_page} / {total_pages} 頁</strong>"
+                f"<span>目前顯示第 {first_number}–{last_number} 段</span></div>",
+                unsafe_allow_html=True,
+            )
+            next_column.button(
+                "下一頁 →",
+                key=f"subtitle_next_{record['id']}",
+                disabled=current_page == total_pages,
+                use_container_width=True,
+                on_click=set_subtitle_page,
+                args=(
+                    page_key,
+                    current_page + 1,
+                    total_pages,
+                    jump_key,
+                    int(
+                        rows[min(len(rows) - 1, current_page * SUBTITLE_ROWS_PER_PAGE)][
+                            "段落"
+                        ]
+                    ),
+                ),
+            )
+            last_column.button(
+                "最後頁 ⇥",
+                key=f"subtitle_last_{record['id']}",
+                disabled=current_page == total_pages,
+                use_container_width=True,
+                on_click=set_subtitle_page,
+                args=(
+                    page_key,
+                    total_pages,
+                    total_pages,
+                    jump_key,
+                    int(rows[(total_pages - 1) * SUBTITLE_ROWS_PER_PAGE]["段落"]),
+                ),
+            )
+
+            jump_input_column, jump_button_column = st.columns([4, 1], vertical_alignment="bottom")
+            jump_input_column.number_input(
+                "直接跳到段落",
+                min_value=1,
+                max_value=len(segments),
+                step=1,
+                key=jump_key,
+                help="若目前有篩選，定位時會清除篩選並顯示該段落。",
+            )
+            jump_button_column.button(
+                "定位",
+                key=f"subtitle_jump_button_{record['id']}",
+                use_container_width=True,
+                on_click=jump_to_subtitle_segment,
+                args=(
+                    page_key,
+                    jump_key,
+                    search_filter_key,
+                    dense_key,
+                    len(segments),
+                    jump_notice_key,
+                ),
+            )
+
+        if jump_notice := st.session_state.pop(jump_notice_key, None):
+            target_number, filters_cleared = jump_notice
+            suffix = "，並已清除篩選" if filters_cleared else ""
+            st.info(f"已定位到第 {target_number} 段{suffix}。")
+        if edit_notice := st.session_state.pop(edit_notice_key, None):
+            changed, first_changed, last_changed = edit_notice
+            location = (
+                f"第 {first_changed} 段"
+                if first_changed == last_changed
+                else f"第 {first_changed}–{last_changed} 段"
+            )
+            st.success(f"已自動儲存 {location}（{changed} 個修改）。")
+
+        # Page and version are part of the identity so Streamlit never reapplies an old
+        # cell delta to different subtitle rows after paging, filtering, or replace-all.
+        filter_token = hashlib.sha1(f"{search}|{only_dense}".encode("utf-8")).hexdigest()[:8]
+        editor_key = (
+            f"subtitle_editor_{record['id']}_{filter_token}_{current_page}_"
+            f"{st.session_state[editor_version_key]}"
+        )
+        st.data_editor(
+            page_rows,
+            key=editor_key,
+            hide_index=True,
+            use_container_width=True,
+            disabled=["段落", "開始", "長度", "字/秒"],
+            on_change=save_subtitle_editor_delta,
+            args=(record, editor_key, page_rows, editor_version_key, edit_notice_key),
+            column_config={
+                "段落": st.column_config.NumberColumn(width="small", help="對應原始字幕編號"),
+                "開始": st.column_config.TextColumn(width="small"),
+                "長度": st.column_config.NumberColumn(width="small", format="%.2f 秒"),
+                "字/秒": st.column_config.NumberColumn(
+                    width="small",
+                    format="%.1f",
+                    help=f"超過 {FAST_SUBTITLE_CPS:.0f} 代表這段字幕偏快",
+                ),
+                "字幕": st.column_config.TextColumn(width="large"),
+            },
+        )
+
+    if revert_notice_key in st.session_state:
+        restored = st.session_state.pop(revert_notice_key)
+        st.success(f"已還原 {restored} 個段落。")
+
+    # An imported subtitle's "source" is the .srt itself, which exists but has no audio, so
+    # checking only that the path exists left a button that could only ever fail.
+    if record.get("is_subtitle"):
+        audition_blocker = "匯入的字幕沒有對應的音訊，無法試聽。"
+    elif not input_path.exists():
+        audition_blocker = "原始檔案已不存在（上傳的暫存檔可能已被清除），無法試聽。"
+    else:
+        audition_blocker = ""
+
+    number_column, play_column, revert_column = st.columns([2, 1, 1], vertical_alignment="bottom")
+    audition_target_key = f"subtitle_audition_{record['id']}"
+    visible_numbers = [int(row["段落"]) for row in page_rows]
+    if visible_numbers and st.session_state.get(audition_target_key) not in visible_numbers:
+        st.session_state[audition_target_key] = visible_numbers[0]
+    target = number_column.number_input(
+        "試聽段落（會跟著目前頁面）",
+        min_value=1,
+        max_value=len(segments),
+        step=1,
+        key=audition_target_key,
+        disabled=bool(audition_blocker),
+    )
+    with play_column:
+        play = st.button(
+            "▶ 試聽此段",
+            key=f"subtitle_play_{record['id']}",
+            disabled=bool(audition_blocker),
+            use_container_width=True,
+        )
     with revert_column:
-        if st.button(
+        st.button(
             "↩ 還原全部",
             key=f"subtitle_revert_{record['id']}",
             disabled=not record.get("edited"),
             use_container_width=True,
             help="把所有字幕還原成剛轉譯完的原始文字。",
-        ):
-            st.success(f"已還原 {restore_original_text(record)} 個段落。")
-            st.rerun(scope="fragment")
+            on_click=restore_subtitles,
+            args=(record, editor_version_key, revert_notice_key),
+        )
+    if audition_blocker:
+        st.caption(audition_blocker)
 
     audition_key = f"subtitle_audio_{record['id']}"
     if play:
@@ -1373,18 +2119,128 @@ def subtitle_editor(record: dict, input_path: Path) -> None:
         st.caption(f"第 {clip['number']} 段：{clip['text']}")
 
 
-def main():
-    st.title("🎙️ Whisper AI 語音轉文字工具")
-    st.caption("選擇媒體、圈選片段，再輸出保留原影片時間碼的字幕。所有處理都在本機完成。")
+def take_pending_input(key: str) -> None:
+    """Apply a value queued for a keyed widget by the previous run.
 
+    A widget's state can't be assigned once it has rendered in the current run, so the
+    enqueue handlers park the new value under `<key>__next` and it lands here first.
+    """
+    pending_key = f"{key}__next"
+    if pending_key in st.session_state:
+        st.session_state[key] = st.session_state.pop(pending_key)
+
+
+def enqueue_uploads(uploaded_files, *, subtitles: bool) -> tuple[int, list[str]]:
+    enqueue = enqueue_subtitle if subtitles else enqueue_media
+    added, problems = 0, []
+    for uploaded_file in uploaded_files:
+        try:
+            problem = enqueue(save_uploaded_file(uploaded_file), is_temp=True)
+        except OSError as exc:
+            problem = f"{uploaded_file.name}：{exc}"
+        if problem is None:
+            added += 1
+        else:
+            problems.append(problem)
+    return added, problems
+
+
+def enqueue_path_lines(lines: list[str], *, subtitles: bool) -> tuple[int, list[str], list[str]]:
+    """Queue each pasted path. Also returns the lines worth leaving in the box to fix."""
+    enqueue = enqueue_subtitle if subtitles else enqueue_media
+    added, problems, keep = 0, [], []
+    for line in lines:
+        candidate = Path(line)
+        if not candidate.exists() or not candidate.is_file():
+            problems.append(f"{line}：找不到檔案")
+            keep.append(line)
+            continue
+        if subtitles and candidate.suffix.lower() not in SUBTITLE_SUFFIXES:
+            problems.append(f"{candidate.name}：不是 .srt 或 .vtt")
+            keep.append(line)
+            continue
+        problem = enqueue(candidate, is_temp=False)
+        if problem is None:
+            added += 1
+            continue
+        problems.append(problem)
+        # A duplicate is already where the user wants it; only real failures stay behind.
+        if not already_queued(str(candidate.resolve())):
+            keep.append(line)
+    return added, problems, keep
+
+
+def pasted_paths(text: str) -> list[str]:
+    lines = [line.strip().strip('"') for line in text.splitlines()]
+    return [line for line in lines if line]
+
+
+def finish_enqueue(added: int, problems: list[str], *, subtitles: bool) -> None:
+    st.session_state.enqueue_summary = (added, problems, subtitles)
+    # A fresh uploader key empties the drop zone; otherwise the same files sit there and a
+    # second click only produces "already queued" warnings.
+    st.session_state.upload_round = st.session_state.get("upload_round", 0) + 1
+    st.rerun()
+
+
+def render_sidebar_nav(queue: list[dict]) -> None:
+    """Step links with live counts. The page is long, and the sidebar is always on screen."""
+    visible = [job for job in queue if not job.get("archived")]
+    pending = sum(1 for job in visible if job["status"] == "pending")
+    failed = sum(1 for job in visible if job["status"] == "error")
+    finished = sum(1 for job in queue if job["status"] == "done" and job["record"])
+    rule_count = len(active_rules(get_rules()))
+    if not visible and not finished:
+        next_step = 1
+    elif pending:
+        next_step = 4
+    elif finished:
+        next_step = 5
+    else:
+        next_step = 2
+
+    queue_count = f"待轉 {pending}" + (f"・失敗 {failed}" if failed else "") if visible else "空"
+    items = [
+        (1, "加入檔案", f"{len(visible)} 個" if visible else ""),
+        (2, "佇列與片段", queue_count),
+        (3, "詞庫與規則", f"規則 {rule_count}"),
+        (4, "開始轉譯", f"{pending} 個待轉" if pending else ""),
+        (5, "結果暫存區", f"{finished} 份" if finished else ""),
+    ]
+    rows = []
+    for number, label, count in items:
+        # Steps 4 and 5 are not on the page until something has been queued.
+        present = number <= 3 or bool(queue)
+        css = "done" if number == next_step else ""
+        body = (
+            f"<span class='n'>{number}</span>{esc(label)}"
+            f"<span class='c'>{esc(count)}</span>"
+        )
+        if present:
+            rows.append(f"<a class='{css}' href='#step-{number}'>{body}</a>")
+        else:
+            rows.append(f"<span class='off'>{body}</span>")
+    render_html(
+        "<div class='tsr-nav'><div class='tsr-nav-title'>工作流程（點選可跳到該步驟）</div>"
+        + "".join(rows)
+        + "</div>",
+        st.sidebar,
+    )
+
+
+def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":
         device_label = f"GPU｜{torch.cuda.get_device_name(0)}"
     else:
         device_label = "CPU｜未偵測到 CUDA"
 
+    render_sidebar_nav(get_queue())
     st.sidebar.header("轉譯設定")
-    st.sidebar.caption(device_label)
+    render_html(
+        f"<div class='tsr-chips'>{pill(device_label, 'moss' if device == 'cuda' else 'amber')}</div>",
+        st.sidebar,
+    )
     engine = st.sidebar.selectbox(
         "辨識引擎",
         [ENGINE_BREEZE, ENGINE_WHISPER, ENGINE_SENSEVOICE],
@@ -1393,6 +2249,7 @@ def main():
         "中英夾雜優化，混語錯誤率約為原版的一半，且直接輸出繁體；首次使用會下載約 3GB 模型。"
         "SenseVoice-small 較輕量、推論最快，首次使用下載約 1GB。",
     )
+    st.sidebar.caption(ENGINE_NOTES[engine])
     if engine == ENGINE_WHISPER:
         model_label = st.sidebar.selectbox(
             "速度與品質",
@@ -1426,6 +2283,8 @@ def main():
     output_format = st.sidebar.multiselect(
         "輸出格式", OUTPUT_FORMATS, default=["srt", "txt"]
     )
+    if not output_format:
+        st.sidebar.warning("請至少選擇一種輸出格式，否則無法轉譯與儲存。")
     # Without a remembered state this expander collapses on every rerun, so changing a
     # setting inside it made it snap shut immediately afterwards.
     with st.sidebar.expander("進階設定", expanded=st.session_state.get(ADVANCED_OPEN_KEY, False)):
@@ -1450,140 +2309,145 @@ def main():
     if st.session_state.pop("model_release_notice", False):
         st.sidebar.success("已清除模型快取。")
 
-    st.header("1. 加入待轉譯檔案")
+    render_html(
+        "<div class='tsr-hero'><div>"
+        "<div class='tsr-hero-title'>🎙️ Whisper AI 語音轉文字工具</div>"
+        "<div class='tsr-hero-sub'>加入檔案、圈選片段，轉成保留原影片時間碼的字幕。"
+        "所有處理都在本機完成。</div></div>"
+        f"<div class='tsr-chips'>{pill(ENGINE_SHORT_NAMES[engine], 'moss')}"
+        f"{pill(language_label, 'neutral')}</div></div>"
+    )
+
+    step_header(1, "加入待轉譯檔案", "一次可以加入多個檔案，之後在第 2 步逐一設定要轉的片段。")
     input_mode = st.radio(
         "輸入方式",
         [UPLOAD_MODE, PATH_MODE, SUBTITLE_MODE],
         horizontal=True,
         label_visibility="collapsed",
+        key="input_mode",
     )
+    st.caption(INPUT_MODE_HINTS[input_mode])
+    upload_round = st.session_state.get("upload_round", 0)
 
     if input_mode == SUBTITLE_MODE:
-        st.caption(
-            "匯入以前轉好的字幕，直接套用取代規則、修改文字後存回原檔。"
-            "不需要影片，但也因此無法逐段試聽。"
+        # A keyed radio rather than st.tabs: the tabs fell back to the first tab after a
+        # rerun, so importing by path flipped the view back to the uploader.
+        subtitle_source = st.radio(
+            "字幕來源",
+            ["上傳字幕檔", "輸入字幕路徑"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="subtitle_source",
         )
-        subtitle_upload, subtitle_path = st.tabs(["上傳字幕檔", "輸入字幕路徑"])
-        with subtitle_upload:
+        if subtitle_source == "上傳字幕檔":
             uploaded_subtitles = st.file_uploader(
                 "選擇字幕檔（可一次選多個）",
                 type=["srt", "vtt"],
                 accept_multiple_files=True,
-                key="subtitle_uploader",
+                key=f"subtitle_uploader_{upload_round}",
             )
+            if uploaded_subtitles:
+                st.caption("上傳的字幕會存到 outputs/，無法覆蓋原始檔案；要覆蓋請改用「輸入字幕路徑」。")
             if uploaded_subtitles and st.button(
                 f"匯入 {len(uploaded_subtitles)} 個字幕檔",
                 type="primary",
                 use_container_width=True,
                 key="import_uploaded_subtitles",
             ):
-                problems = []
                 with st.spinner("正在讀取字幕..."):
-                    for uploaded_file in uploaded_subtitles:
-                        try:
-                            problems.append(
-                                enqueue_subtitle(save_uploaded_file(uploaded_file), is_temp=True)
-                            )
-                        except OSError as exc:
-                            problems.append(f"{uploaded_file.name}：{exc}")
-                st.session_state.enqueue_report = [p for p in problems if p]
-                st.rerun()
-            if uploaded_subtitles:
-                st.caption("上傳的字幕會存到 outputs/，無法覆蓋原始檔案；要覆蓋請改用路徑分頁。")
-        with subtitle_path:
+                    added, problems = enqueue_uploads(uploaded_subtitles, subtitles=True)
+                finish_enqueue(added, problems, subtitles=True)
+        else:
+            take_pending_input("subtitle_path_input")
             subtitle_input = st.text_area(
                 "貼上字幕檔完整路徑，一行一個",
                 height=110,
                 placeholder="D:\\Videos\\1222.srt\nD:\\Videos\\1223.srt",
                 key="subtitle_path_input",
             )
-            subtitle_candidates = [
-                line.strip().strip('"') for line in subtitle_input.splitlines()
-            ]
-            subtitle_candidates = [line for line in subtitle_candidates if line]
+            st.caption("以路徑匯入時，儲存會直接覆蓋原始字幕檔。")
+            subtitle_candidates = pasted_paths(subtitle_input)
             if subtitle_candidates and st.button(
                 f"匯入 {len(subtitle_candidates)} 個字幕檔",
                 type="primary",
                 use_container_width=True,
                 key="import_subtitle_paths",
             ):
-                problems = []
                 with st.spinner("正在讀取字幕..."):
-                    for line in subtitle_candidates:
-                        candidate = Path(line)
-                        if not candidate.exists() or not candidate.is_file():
-                            problems.append(f"{line}：找不到檔案")
-                        elif candidate.suffix.lower() not in SUBTITLE_SUFFIXES:
-                            problems.append(f"{candidate.name}：不是 .srt 或 .vtt")
-                        else:
-                            problems.append(enqueue_subtitle(candidate, is_temp=False))
-                st.session_state.enqueue_report = [p for p in problems if p]
-                st.rerun()
-            st.caption("以路徑匯入時，儲存會直接覆蓋原始字幕檔。")
+                    added, problems, keep = enqueue_path_lines(subtitle_candidates, subtitles=True)
+                st.session_state["subtitle_path_input__next"] = "\n".join(keep)
+                finish_enqueue(added, problems, subtitles=True)
     elif input_mode == UPLOAD_MODE:
         uploaded_files = st.file_uploader(
             "選擇影片或音檔（可一次選多個）",
             type=["mp4", "mkv", "mov", "avi", "mp3", "wav", "m4a"],
             accept_multiple_files=True,
+            key=f"media_uploader_{upload_round}",
         )
         if uploaded_files and st.button(
             f"加入佇列（{len(uploaded_files)} 個檔案）", type="primary", use_container_width=True
         ):
-            problems = []
             with st.spinner("正在讀取檔案..."):
-                for uploaded_file in uploaded_files:
-                    try:
-                        problems.append(
-                            enqueue_media(save_uploaded_file(uploaded_file), is_temp=True)
-                        )
-                    except OSError as exc:
-                        problems.append(f"{uploaded_file.name}：{exc}")
-            st.session_state.enqueue_report = [p for p in problems if p]
-            st.rerun()
+                added, problems = enqueue_uploads(uploaded_files, subtitles=False)
+            finish_enqueue(added, problems, subtitles=False)
     else:
+        take_pending_input("media_path_input")
         path_input = st.text_area(
             "貼上檔案完整路徑，一行一個（例如 D:\\Videos\\1222.mp4）",
             height=110,
             placeholder="D:\\Videos\\1222.mp4\nD:\\Videos\\1223.mp4",
+            key="media_path_input",
         )
-        candidates = [line.strip().strip('"') for line in path_input.splitlines()]
-        candidates = [line for line in candidates if line]
+        st.caption("小技巧：在檔案總管選取檔案後按 Ctrl+Shift+C 可以複製完整路徑，前後的引號會自動去掉。")
+        candidates = pasted_paths(path_input)
         if candidates and st.button(
             f"加入佇列（{len(candidates)} 個路徑）", type="primary", use_container_width=True
         ):
-            problems = []
             with st.spinner("正在讀取檔案..."):
-                for line in candidates:
-                    candidate = Path(line)
-                    if candidate.exists() and candidate.is_file():
-                        problems.append(enqueue_media(candidate, is_temp=False))
-                    else:
-                        problems.append(f"{line}：找不到檔案")
-            st.session_state.enqueue_report = [p for p in problems if p]
-            st.rerun()
+                added, problems, keep = enqueue_path_lines(candidates, subtitles=False)
+            st.session_state["media_path_input__next"] = "\n".join(keep)
+            finish_enqueue(added, problems, subtitles=False)
 
-    for problem in st.session_state.pop("enqueue_report", []):
-        st.warning(problem)
+    if summary := st.session_state.pop("enqueue_summary", None):
+        added, problems, subtitles = summary
+        if added:
+            where = "第 5 步「結果暫存區」編輯" if subtitles else "第 2 步「佇列與片段」"
+            st.success(f"已加入 {added} 個檔案，請到{where}繼續。")
+        if problems:
+            st.warning(
+                "以下項目沒有加入：\n\n" + "\n".join(f"- {problem}" for problem in problems)
+            )
 
     queue = get_queue()
-    pending_jobs = [job for job in queue if job["status"] == "pending"]
-    done_jobs = [job for job in queue if job["status"] == "done"]
-    if queue:
-        st.header("2. 佇列與片段")
-        summary = st.columns(4)
-        summary[0].metric("佇列檔案", len(queue))
-        summary[1].metric("待轉譯", len(pending_jobs))
-        summary[2].metric("完成", len(done_jobs))
-        summary[3].metric(
-            "待轉譯總長",
-            format_hhmmss(sum(job["end"] - job["start"] for job in pending_jobs)),
-        )
-        render_queue_table(queue, done_jobs)
+    visible_jobs = queue_view()
+    pending_jobs = [job for job in visible_jobs if job["status"] == "pending"]
+    done_jobs = [job for job in visible_jobs if job["status"] == "done"]
+    failed_jobs = [job for job in visible_jobs if job["status"] == "error"]
+
+    badges = ""
+    if visible_jobs:
+        pending_length = format_hhmmss(sum(job["end"] - job["start"] for job in pending_jobs))
+        badges = pill(f"待轉 {len(pending_jobs)}・總長 {pending_length}", "sky")
+        if done_jobs:
+            badges += pill(f"完成 {len(done_jobs)}", "moss")
+        if failed_jobs:
+            badges += pill(f"失敗 {len(failed_jobs)}", "rust")
+    step_header(2, "佇列與片段", "每個檔案預設轉整片；按「設定片段」可以只轉其中一段。", badges)
+    if visible_jobs:
+        render_queue_table(visible_jobs, done_jobs)
+    else:
+        archived = len(queue) - len(visible_jobs)
+        extra = f"已完成的 {archived} 個項目已從佇列隱藏，結果仍在第 5 步。" if archived else ""
+        empty_state(f"<b>佇列是空的。</b>在上方第 1 步加入檔案後，會列在這裡。{esc(extra)}")
 
     # Rendered even with an empty queue: the glossary and the replacement rules are
     # global, persistent settings, and hiding them behind "add a file first" made a saved
     # rule set look like it had been lost.
-    st.header("3. 專有名詞與取代規則")
+    step_header(
+        3,
+        "專有名詞與取代規則",
+        "兩份清單都會存檔、所有檔案共用。詞庫只會提示 Whisper；取代規則在轉譯完成後一定會套用。",
+    )
     prompt_supported = engine == ENGINE_WHISPER
     glossary_panel(prompt_supported=prompt_supported)
     # Only the prompt that actually reaches a model counts as a setting worth re-running for.
@@ -1591,7 +2455,6 @@ def main():
     rules_panel()
 
     if not queue:
-        st.info("佇列是空的，請在上方加入至少一個檔案才能開始轉譯。")
         return
 
     settings = {
@@ -1605,33 +2468,75 @@ def main():
         "prevent_drift": prevent_drift,
         "output_format": output_format,
     }
-    render_transcription_step(queue, pending_jobs, settings, device, cleanup_temp_file)
+    render_transcription_step(pending_jobs, settings, device, cleanup_temp_file)
     render_results(output_format)
 
 
 def render_queue_table(queue: list[dict], done_jobs: list[dict]) -> None:
+    focused_id = st.session_state.get("focused_job")
     with st.container(border=True):
-        for job in queue:
+        for index, job in enumerate(queue):
+            if index:
+                st.divider()
             name_col, range_col, status_col, action_col, remove_col = st.columns(
-                [5, 3, 2, 2, 1]
+                [5, 2.4, 1.5, 1.7, 1.1], vertical_alignment="center"
             )
-            name_col.markdown(f"**{job['name']}**")
-            name_col.caption(job["path"])
+            is_focused = job["id"] == focused_id and job["status"] != "done"
+            is_imported = bool(job.get("record") and job["record"].get("is_subtitle"))
+
+            error_html = (
+                f"<div class='tsr-error'>⚠️ {esc(job['error'])}</div>"
+                if job["status"] == "error" and job.get("error")
+                else ""
+            )
+            render_html(
+                f"<div class='tsr-file'>{esc(job['name'])}</div>"
+                f"<div class='tsr-path'>{esc(job['path'])}</div>{error_html}",
+                name_col,
+            )
+
             trimmed = job["start"] > 0.05 or job["end"] < job["duration"] - 0.05
-            range_col.caption(
-                f"{format_hhmmss(job['start'])} – {format_hhmmss(job['end'])}"
-                + ("（已裁切）" if trimmed else "（全片）")
+            scope = "已裁切" if trimmed else "全片"
+            render_html(
+                f"<div class='tsr-range'>{format_hhmmss(job['start'])} – {format_hhmmss(job['end'])}"
+                f"<br><span>{scope}・長度 {format_hhmmss(job['end'] - job['start'])}</span></div>",
+                range_col,
             )
-            status_col.caption(STATUS_LABELS.get(job["status"], job["status"]))
-            if job["status"] == "error":
-                status_col.caption(f"⚠️ {job['error']}")
-            if job["status"] == "done":
+
+            status_html = pill(
+                "已匯入" if is_imported else STATUS_LABELS.get(job["status"], job["status"]),
+                STATUS_TONES.get(job["status"], "neutral"),
+            )
+            if is_focused:
+                status_html += f"<div style='margin-top:.25rem'>{pill('設定中', 'amber')}</div>"
+            render_html(status_html, status_col)
+
+            if is_imported:
+                action_col.caption("到第 5 步編輯")
+            elif job["status"] == "done":
                 action_col.button(
                     "重新轉譯",
                     key=f"requeue_{job['id']}",
                     use_container_width=True,
+                    help="用目前的設定重跑，會覆蓋這份結果和已做的字幕修改。",
                     on_click=requeue_job,
                     args=(job["id"],),
+                )
+            elif job["status"] == "error":
+                action_col.button(
+                    "重試",
+                    key=f"retry_{job['id']}",
+                    use_container_width=True,
+                    help="放回待轉譯，下次按「開始轉譯」時會再跑一次。",
+                    on_click=requeue_job,
+                    args=(job["id"],),
+                )
+            elif is_focused:
+                action_col.button(
+                    "收起片段",
+                    key=f"focus_{job['id']}",
+                    use_container_width=True,
+                    on_click=unfocus_job,
                 )
             else:
                 action_col.button(
@@ -1641,29 +2546,33 @@ def render_queue_table(queue: list[dict], done_jobs: list[dict]) -> None:
                     on_click=focus_job,
                     args=(job["id"],),
                 )
+            remove_help = (
+                f"從佇列移除 {job['name']}，它的結果也會從暫存區刪除"
+                if job["status"] == "done"
+                else f"從佇列移除 {job['name']}"
+            )
             remove_col.button(
-                "🗑",
+                "移除",
                 key=f"remove_{job['id']}",
-                help=f"從佇列移除 {job['name']}",
+                use_container_width=True,
+                help=remove_help,
                 on_click=remove_job,
                 args=(job["id"],),
             )
 
     if done_jobs:
         st.button(
-            "清除已完成的佇列項目（結果會保留在下方）",
+            f"從佇列隱藏 {len(done_jobs)} 個已完成的項目（結果會保留在第 5 步）",
             key="clear_done",
             on_click=clear_finished_jobs,
         )
 
-    focused_id = st.session_state.get("focused_job")
     focused = next((job for job in queue if job["id"] == focused_id), None)
     if focused is not None and focused["status"] != "done":
         render_range_editor(focused)
 
 
 def render_transcription_step(
-    queue: list[dict],
     pending_jobs: list[dict],
     settings: dict,
     device: str,
@@ -1671,11 +2580,37 @@ def render_transcription_step(
 ) -> None:
     output_format = settings["output_format"]
     model_display = settings["model_display"]
-    st.header("4. 開始轉譯")
+    engine = settings["engine"]
+    step_header(4, "開始轉譯", "依序處理所有待轉譯的檔案；單一檔案失敗不會中斷其他檔案。")
+
+    glossary_terms = len(active_terms(get_glossary()))
+    rule_count = len(active_rules(get_rules()))
+    chips = [
+        chip("引擎", ENGINE_SHORT_NAMES[engine]),
+        chip("模型", model_display),
+        chip("語言", settings["language_label"]),
+        chip("中文輸出", settings["chinese_output_label"]),
+        chip("輸出格式", "・".join(output_format) if output_format else "未選擇", warn=not output_format),
+    ]
+    if engine == ENGINE_WHISPER:
+        chips.append(chip("詞庫提示", f"{glossary_terms} 個詞" if glossary_terms else "只用開頭提示語"))
+    else:
+        chips.append(chip("詞庫提示", "此引擎不使用", warn=bool(glossary_terms)))
+    chips.append(chip("取代規則", f"{rule_count} 條會自動套用" if rule_count else "未啟用"))
+    if engine != ENGINE_SENSEVOICE:
+        chips.append(chip("防止翻譯漂移", "開" if settings["prevent_drift"] else "關"))
+    render_html(f"<div class='tsr-chips'>{''.join(chips)}</div>")
+    st.caption("這些設定來自左側側欄與第 3 步；要調整請先改好再開始。")
+
     if not output_format:
-        st.warning("請至少選擇一種輸出格式。")
+        st.warning("請至少在左側選擇一種輸出格式。")
+    elif not pending_jobs:
+        st.caption(
+            "目前沒有待轉譯的檔案。要重跑已完成的檔案，請在第 2 步按「重新轉譯」；"
+            "失敗的檔案按「重試」。"
+        )
     run_queue = st.button(
-        f"轉譯佇列中的 {len(pending_jobs)} 個檔案｜{model_display}",
+        f"▶ 開始轉譯 {len(pending_jobs)} 個檔案｜{model_display}",
         type="primary",
         disabled=not pending_jobs or not output_format,
         use_container_width=True,
@@ -1685,7 +2620,10 @@ def render_transcription_step(
         overall = st.progress(0)
         status_line = st.empty()
         for index, job in enumerate(pending_jobs):
-            status_line.info(f"（{index + 1}/{len(pending_jobs)}）正在轉譯 {job['name']}...")
+            status_line.info(
+                f"（{index + 1}/{len(pending_jobs)}）正在用 {ENGINE_SHORT_NAMES[engine]} 轉譯 "
+                f"{job['name']}…　如果是第一次使用這個引擎，會先下載模型，可能需要幾分鐘。"
+            )
             job["status"] = "running"
             try:
                 job["record"] = transcribe_job(job, settings, device)
@@ -1706,239 +2644,296 @@ def render_transcription_step(
     if report := st.session_state.pop("queue_report", None):
         succeeded, failed = report
         if succeeded:
-            st.success(f"完成 {succeeded} 個檔案的轉譯。")
+            st.success(f"完成 {succeeded} 個檔案的轉譯，結果在下方第 5 步。")
         if failed:
-            st.error(f"{failed} 個檔案轉譯失敗，詳情見上方佇列。")
+            st.error(f"{failed} 個檔案轉譯失敗，原因列在第 2 步的佇列裡，可以按「重試」。")
 
 
 def render_range_editor(job: dict) -> None:
     """Waveform and A-B range editor for one queue entry."""
     source_path = Path(job["path"])
-    st.subheader(f"設定片段：{job['name']}")
-    try:
-        source_stat = source_path.stat()
-        with st.spinner("正在分析音軌並建立波形..."):
-            duration, times, amplitudes = analyze_media(
-                str(source_path.resolve()), source_stat.st_size, source_stat.st_mtime_ns
-            )
-    except (OSError, MediaProcessingError) as exc:
-        st.error(f"無法建立音訊波形：{exc}")
-        return
-
     source_id = job["id"]
-    range_key = f"transcript_range_{source_id}"
-    start_time_key = f"transcript_start_time_{source_id}"
-    end_time_key = f"transcript_end_time_{source_id}"
-    selection_key = f"waveform_selection_{source_id}"
-    selection_token_key = f"waveform_selection_token_{source_id}"
-    plot_version_key = f"waveform_version_{source_id}"
-    if range_key not in st.session_state:
-        st.session_state[range_key] = (0.0, float(duration))
-    if start_time_key not in st.session_state:
-        st.session_state[start_time_key] = format_hhmmss(0.0, include_milliseconds=True)
-    if end_time_key not in st.session_state:
-        st.session_state[end_time_key] = format_hhmmss(duration, include_milliseconds=True)
-    if plot_version_key not in st.session_state:
-        st.session_state[plot_version_key] = 0
-    selected_range = tuple(st.session_state[range_key])
-
-    st.caption(
-        "在波形上由左往右拖曳即可套用範圍；也可以直接輸入精確到毫秒的時間碼。"
-    )
-    event = st.plotly_chart(
-        waveform_figure(times, amplitudes, selected_range, duration),
-        use_container_width=True,
-        key=f"{selection_key}_{st.session_state[plot_version_key]}",
-        on_select="rerun",
-        selection_mode="box",
-        config={"displaylogo": False, "displayModeBar": False, "scrollZoom": False},
-    )
-    bounds = selection_bounds(event, duration)
-    if bounds and bounds[1] - bounds[0] >= 0.1:
-        normalized = (
-            float(max(0, round(bounds[0], 3))),
-            float(min(duration, round(bounds[1], 3))),
-        )
-        if st.session_state.get(selection_token_key) != normalized:
-            st.session_state[selection_token_key] = normalized
-            st.session_state[range_key] = normalized
-            st.session_state[start_time_key] = format_hhmmss(
-                normalized[0], include_milliseconds=True
-            )
-            st.session_state[end_time_key] = format_hhmmss(
-                normalized[1], include_milliseconds=True
-            )
-            st.session_state[plot_version_key] += 1
-            st.rerun()
-
-    with st.form(f"time_range_form_{source_id}", border=True):
-        start_col, end_col, update_col = st.columns([2, 2, 1])
-        with start_col:
-            start_text = st.text_input(
-                "開始 A（HH:MM:SS.mmm）",
-                key=start_time_key,
-                placeholder="00:00:00.000",
-            )
-        with end_col:
-            end_text = st.text_input(
-                "結束 B（HH:MM:SS.mmm）",
-                key=end_time_key,
-                placeholder="00:00:00.000",
-            )
-        with update_col:
-            st.write("")
-            update_range = st.form_submit_button("套用時間", use_container_width=True)
-
-    if update_range:
-        try:
-            entered_start = parse_hhmmss(start_text)
-            entered_end = min(parse_hhmmss(end_text), float(duration))
-            if entered_start >= entered_end:
-                raise ValueError("結束 B 必須晚於開始 A。")
-            st.session_state[range_key] = (entered_start, entered_end)
-            st.session_state[selection_token_key] = None
-            st.session_state[plot_version_key] += 1
-            st.rerun()
-        except ValueError as exc:
-            st.error(str(exc))
-
-    selected_start, selected_end = tuple(st.session_state[range_key])
-    duration_selected = selected_end - selected_start
-    reset_col, preview_col = st.columns(2)
-    with reset_col:
-        st.button(
-            "重設為全片",
-            key=f"reset_{source_id}",
+    with st.container(border=True):
+        title_column, close_column = st.columns([4, 1], vertical_alignment="center")
+        render_html(f"<div class='tsr-subhead'>✂️ 設定片段：{esc(job['name'])}</div>", title_column)
+        # At the top, not the bottom: the old bottom button sat after an early return and
+        # disappeared whenever the selection was shorter than 0.5 s.
+        close_column.button(
+            "完成，收起",
+            key=f"unfocus_{source_id}",
             use_container_width=True,
-            on_click=reset_selected_range,
-            args=(
-                range_key,
-                start_time_key,
-                end_time_key,
-                selection_token_key,
-                plot_version_key,
-                duration,
-            ),
+            on_click=unfocus_job,
         )
-    with preview_col:
-        make_preview = st.button(
-            "試聽選取起點 30 秒",
-            key=f"preview_{source_id}",
-            disabled=duration_selected < 0.5,
-            use_container_width=True,
-        )
-
-    if make_preview:
-        preview_file = TEMP_DIR / f"preview_{uuid.uuid4().hex}.wav"
         try:
-            preview_end = min(selected_end, selected_start + 30.0)
-            with st.spinner("正在建立試聽片段..."):
-                extract_audio_range(source_path, preview_file, selected_start, preview_end)
-            st.session_state[preview_state_key(source_id)] = {
-                "range": (selected_start, selected_end),
-                "data": preview_file.read_bytes(),
-                "seconds": preview_end - selected_start,
-            }
-        except (OSError, MediaProcessingError, ValueError) as exc:
-            st.error(f"無法建立試聽片段：{exc}")
-        finally:
-            cleanup_file(preview_file)
+            source_stat = source_path.stat()
+            with st.spinner("正在分析音軌並建立波形..."):
+                duration, times, amplitudes = analyze_media(
+                    str(source_path.resolve()), source_stat.st_size, source_stat.st_mtime_ns
+                )
+        except (OSError, MediaProcessingError) as exc:
+            st.error(f"無法建立音訊波形：{exc}")
+            return
 
-    preview_record = st.session_state.get(preview_state_key(source_id))
-    if preview_record and tuple(preview_record["range"]) == (selected_start, selected_end):
-        st.audio(preview_record["data"], format="audio/wav")
-        st.caption(f"試聽長度：{preview_record['seconds']:.1f} 秒")
+        range_key = f"transcript_range_{source_id}"
+        start_time_key = f"transcript_start_time_{source_id}"
+        end_time_key = f"transcript_end_time_{source_id}"
+        selection_key = f"waveform_selection_{source_id}"
+        selection_token_key = f"waveform_selection_token_{source_id}"
+        plot_version_key = f"waveform_version_{source_id}"
+        if range_key not in st.session_state:
+            st.session_state[range_key] = (0.0, float(duration))
+        if start_time_key not in st.session_state:
+            st.session_state[start_time_key] = format_hhmmss(0.0, include_milliseconds=True)
+        if end_time_key not in st.session_state:
+            st.session_state[end_time_key] = format_hhmmss(duration, include_milliseconds=True)
+        if plot_version_key not in st.session_state:
+            st.session_state[plot_version_key] = 0
+        selected_range = tuple(st.session_state[range_key])
 
-    range_columns = st.columns(3)
-    range_columns[0].metric(
-        "開始",
-        format_hhmmss(selected_start, include_milliseconds=True),
-    )
-    range_columns[1].metric(
-        "結束",
-        format_hhmmss(selected_end, include_milliseconds=True),
-    )
-    range_columns[2].metric(
-        "選取長度",
-        format_hhmmss(duration_selected, include_milliseconds=True),
-    )
-    if duration_selected < 0.5:
-        st.warning("選取範圍至少需要 0.5 秒。")
-        return
+        selected_start, selected_end = selected_range
+        duration_selected = selected_end - selected_start
+        render_html(
+            "<div class='tsr-chips'>"
+            + chip("A 開始", format_hhmmss(selected_start, include_milliseconds=True))
+            + chip("B 結束", format_hhmmss(selected_end, include_milliseconds=True))
+            + chip("選取長度", format_hhmmss(duration_selected, include_milliseconds=True),
+                   warn=duration_selected < 0.5)
+            + chip("全片", format_hhmmss(duration, include_milliseconds=True))
+            + "</div>"
+        )
+        st.caption("在波形上由左往右拖曳即可套用範圍；也可以在下方輸入精確到毫秒的時間碼。")
+        event = st.plotly_chart(
+            waveform_figure(times, amplitudes, selected_range, duration),
+            use_container_width=True,
+            key=f"{selection_key}_{st.session_state[plot_version_key]}",
+            on_select="rerun",
+            selection_mode="box",
+            config={"displaylogo": False, "displayModeBar": False, "scrollZoom": False},
+        )
+        bounds = selection_bounds(event, duration)
+        if bounds and bounds[1] - bounds[0] >= 0.1:
+            normalized = (
+                float(max(0, round(bounds[0], 3))),
+                float(min(duration, round(bounds[1], 3))),
+            )
+            if st.session_state.get(selection_token_key) != normalized:
+                st.session_state[selection_token_key] = normalized
+                st.session_state[range_key] = normalized
+                st.session_state[start_time_key] = format_hhmmss(
+                    normalized[0], include_milliseconds=True
+                )
+                st.session_state[end_time_key] = format_hhmmss(
+                    normalized[1], include_milliseconds=True
+                )
+                st.session_state[plot_version_key] += 1
+                st.rerun()
 
-    # The queue entry owns the range; session_state only backs the widgets above.
-    job["start"], job["end"] = float(selected_start), float(selected_end)
-    st.button(
-        "收起片段設定",
-        key=f"unfocus_{source_id}",
-        on_click=lambda: st.session_state.pop("focused_job", None),
-    )
+        with st.form(f"time_range_form_{source_id}", border=True):
+            start_col, end_col, update_col = st.columns([2, 2, 1], vertical_alignment="bottom")
+            with start_col:
+                start_text = st.text_input(
+                    "開始 A（HH:MM:SS.mmm）",
+                    key=start_time_key,
+                    placeholder="00:00:00.000",
+                )
+            with end_col:
+                end_text = st.text_input(
+                    "結束 B（HH:MM:SS.mmm）",
+                    key=end_time_key,
+                    placeholder="00:00:00.000",
+                )
+            with update_col:
+                update_range = st.form_submit_button("套用時間", use_container_width=True)
+
+        if update_range:
+            try:
+                entered_start = parse_hhmmss(start_text)
+                entered_end = min(parse_hhmmss(end_text), float(duration))
+                if entered_start >= entered_end:
+                    raise ValueError("結束 B 必須晚於開始 A。")
+                st.session_state[range_key] = (entered_start, entered_end)
+                st.session_state[selection_token_key] = None
+                st.session_state[plot_version_key] += 1
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+
+        reset_col, preview_col = st.columns(2)
+        with reset_col:
+            st.button(
+                "重設為全片",
+                key=f"reset_{source_id}",
+                use_container_width=True,
+                on_click=reset_selected_range,
+                args=(
+                    range_key,
+                    start_time_key,
+                    end_time_key,
+                    selection_token_key,
+                    plot_version_key,
+                    duration,
+                ),
+            )
+        with preview_col:
+            make_preview = st.button(
+                "▶ 試聽選取起點 30 秒",
+                key=f"preview_{source_id}",
+                disabled=duration_selected < 0.5,
+                use_container_width=True,
+            )
+
+        if make_preview:
+            preview_file = TEMP_DIR / f"preview_{uuid.uuid4().hex}.wav"
+            try:
+                preview_end = min(selected_end, selected_start + 30.0)
+                with st.spinner("正在建立試聽片段..."):
+                    extract_audio_range(source_path, preview_file, selected_start, preview_end)
+                st.session_state[preview_state_key(source_id)] = {
+                    "range": (selected_start, selected_end),
+                    "data": preview_file.read_bytes(),
+                    "seconds": preview_end - selected_start,
+                }
+            except (OSError, MediaProcessingError, ValueError) as exc:
+                st.error(f"無法建立試聽片段：{exc}")
+            finally:
+                cleanup_file(preview_file)
+
+        preview_record = st.session_state.get(preview_state_key(source_id))
+        if preview_record and tuple(preview_record["range"]) == (selected_start, selected_end):
+            st.audio(preview_record["data"], format="audio/wav")
+            st.caption(f"試聽長度：{preview_record['seconds']:.1f} 秒")
+
+        if duration_selected < 0.5:
+            st.warning("選取範圍至少需要 0.5 秒，這個檔案目前仍會沿用上一次的有效範圍。")
+            return
+
+        # The queue entry owns the range; session_state only backs the widgets above.
+        job["start"], job["end"] = float(selected_start), float(selected_end)
+
+
+def batch_save_targets(finished: list[dict], output_formats: list[str]) -> tuple[list[str], list[str]]:
+    """Files "save all" would overwrite, and files more than one result would write.
+
+    The second case happens when the same source was transcribed twice; saving all then
+    keeps whichever result comes last, silently, so it has to be called out.
+    """
+    writes: dict[Path, int] = {}
+    for entry in finished:
+        record = entry["record"]
+        directory = resolve_output_directory(record)
+        stem = output_stem(record)
+        for extension in output_formats:
+            target = directory / f"{stem}.{extension}"
+            writes[target] = writes.get(target, 0) + 1
+    existing = sorted({target.name for target in writes if target.exists()})
+    shared = sorted({target.name for target, count in writes.items() if count > 1})
+    return existing, shared
 
 
 def render_results(output_formats: list[str]) -> None:
     """Staging area: every finished transcript stays here for editing and saving."""
     finished = [job for job in get_queue() if job["status"] == "done" and job["record"]]
-    st.header("5. 結果暫存區")
+    step_header(
+        5,
+        "結果暫存區",
+        "這個工作階段的每份結果都留在這裡，可以隨時回來編輯、儲存或下載。重新整理瀏覽器會清空。",
+        pill(f"{len(finished)} 份", "moss") if finished else "",
+    )
     if not finished:
-        st.info("還沒有完成的轉譯結果。轉譯完成後會留在這裡，可以隨時回來繼續編輯與下載。")
+        empty_state(
+            "<b>還沒有完成的結果。</b>按第 4 步的「開始轉譯」或在第 1 步匯入字幕後，結果會出現在這裡。"
+        )
         return
 
-    st.caption(
-        f"共 {len(finished)} 份結果暫存在這個工作階段中。編輯後的內容會保留，"
-        "重新整理瀏覽器才會清空。"
-    )
     labels = {
         f"{job['name']}｜{job['record']['created_at']}": job for job in finished
     }
-    selected_label = st.selectbox("選擇要編輯的結果", list(labels), index=len(labels) - 1)
+    select_column, save_all_column = st.columns([3, 1.4], vertical_alignment="bottom")
+    selected_label = select_column.selectbox(
+        "選擇要編輯的結果", list(labels), index=len(labels) - 1
+    )
+    save_all_report = st.container()
+    with save_all_column.popover(
+        f"💾 全部存檔（{len(finished)} 份）",
+        use_container_width=True,
+        disabled=not output_formats,
+        help="每份結果都存在它自己的原始檔案旁邊。" if output_formats else "請先在左側選擇輸出格式。",
+    ):
+        st.markdown(f"**把 {len(finished)} 份結果各自存回來源資料夾**")
+        st.caption(f"格式：{'、'.join(output_formats)}。上傳的檔案沒有原始位置，會存到 outputs/。")
+        overwritten, shared = batch_save_targets(finished, output_formats)
+        if overwritten:
+            shown = "、".join(overwritten[:8]) + ("…" if len(overwritten) > 8 else "")
+            st.warning(f"會覆蓋 {len(overwritten)} 個既有檔案：{shown}")
+        if shared:
+            shown = "、".join(shared[:8]) + ("…" if len(shared) > 8 else "")
+            st.warning(
+                f"有多份結果會寫到同一個檔名（同一個來源轉了不只一次）：{shown}。"
+                "全部儲存時，清單中較晚的結果會蓋掉較早的；"
+                "要保留特定那份，請到它的「儲存與下載」分頁個別儲存。"
+            )
+        if st.button(
+            "確認全部儲存",
+            key="write_all_results",
+            type="primary",
+            use_container_width=True,
+        ):
+            written, failures = 0, []
+            for entry in finished:
+                try:
+                    save_result_files(entry["record"], output_formats)
+                    written += 1
+                except Exception as exc:
+                    failures.append(f"{entry['name']}：{exc}")
+            with save_all_report:
+                st.success(f"已儲存 {written} 份結果到各自的來源資料夾。")
+                for failure in failures:
+                    st.error(failure)
+
     job = labels[selected_label]
     record = job["record"]
     source_path = Path(record["source_path"])
 
-    if output_formats and st.button(
-        f"把全部 {len(finished)} 份結果存到各自的來源資料夾",
-        key="write_all_results",
-        use_container_width=True,
-        help="每份結果都會存在它自己的原始檔案旁邊，並覆蓋同名檔案。",
-    ):
-        written, failures = 0, []
-        for entry in finished:
-            try:
-                save_result_files(entry["record"], output_formats)
-                written += 1
-            except Exception as exc:
-                failures.append(f"{entry['name']}：{exc}")
-        st.success(f"已儲存 {written} 份結果。")
-        for failure in failures:
-            st.error(failure)
-
     timings = record["timings"]
-    segment_count = len(record["result"].get("segments", []))
-    if record.get("is_subtitle"):
-        # An imported subtitle has no inference to report; realtime would divide by zero.
-        result_metrics = st.columns(3)
-        result_metrics[0].metric("字幕段落", segment_count)
-        result_metrics[1].metric("字幕長度", format_hhmmss(record["source_duration"]))
-        result_metrics[2].metric("狀態", "已修改" if record.get("edited") else "原始")
-        st.caption(f"{record['created_at']}｜匯入自 {record['source_path']}")
-    else:
-        record_duration = record["end"] - record["start"]
-        realtime = record_duration / max(timings["inference"], 0.001)
-        result_metrics = st.columns(4)
-        result_metrics[0].metric("總耗時", f"{timings['total']:.1f} 秒")
-        result_metrics[1].metric("模型推論", f"{timings['inference']:.1f} 秒")
-        result_metrics[2].metric("處理速度", f"{realtime:.1f}× realtime")
-        result_metrics[3].metric("字幕段落", segment_count)
-        st.caption(
-            f"{record['created_at']}｜模型 {record['model']}｜語言 {record['language']}｜"
-            f"音訊 {timings['extraction']:.2f}s｜載入 {timings['model_load']:.2f}s｜"
-            f"後處理 {timings['postprocess']:.2f}s"
+    with st.container(border=True):
+        state_pill = pill("已修改", "amber") if record.get("edited") else pill("未修改", "neutral")
+        render_html(
+            f"<div class='tsr-subhead'>{esc(job['name'])}{state_pill}</div>"
+            f"<div class='tsr-path'>{esc(record['source_path'])}</div>"
         )
-    if record.get("rule_hits"):
-        detail = "、".join(f"{find}×{count}" for find, count in record["rule_hits"].items())
-        st.caption(f"轉譯後已自動套用取代規則：{detail}")
+        if record.get("is_subtitle"):
+            # An imported subtitle has no inference to report; realtime would divide by zero.
+            meta = [
+                chip("來源", "匯入的字幕檔"),
+                chip("字幕長度", format_hhmmss(record["source_duration"])),
+                chip("匯入時間", record["created_at"]),
+            ]
+            render_html(f"<div class='tsr-chips'>{''.join(meta)}</div>")
+        else:
+            meta = [
+                chip("引擎", ENGINE_SHORT_NAMES.get(record["engine"], record["engine"])),
+                chip("模型", record["model"]),
+                chip("語言", record["language"]),
+                chip("範圍", f"{format_hhmmss(record['start'])} – {format_hhmmss(record['end'])}"),
+                chip("完成時間", record["created_at"]),
+            ]
+            render_html(f"<div class='tsr-chips'>{''.join(meta)}</div>")
+            record_duration = record["end"] - record["start"]
+            realtime = record_duration / max(timings["inference"], 0.001)
+            result_metrics = st.columns(4)
+            result_metrics[0].metric("總耗時", f"{timings['total']:.1f} 秒")
+            result_metrics[1].metric("模型推論", f"{timings['inference']:.1f} 秒")
+            result_metrics[2].metric("處理速度", f"{realtime:.1f}× realtime")
+            result_metrics[3].metric(
+                "模型載入",
+                f"{timings['model_load']:.1f} 秒",
+                help=f"音訊擷取 {timings['extraction']:.2f} 秒、後處理 {timings['postprocess']:.2f} 秒",
+            )
+        if record.get("rule_hits"):
+            detail = "、".join(f"{find}×{count}" for find, count in record["rule_hits"].items())
+            st.caption(f"轉譯後已自動套用取代規則：{detail}")
 
-    edit_tab, text_tab, download_tab = st.tabs(["字幕編輯", "純文字", "下載"])
+    edit_tab, text_tab, download_tab = st.tabs(["✏️ 字幕編輯", "📄 純文字", "💾 儲存與下載"])
     with edit_tab:
         subtitle_editor(record, source_path)
 
@@ -1961,8 +2956,10 @@ def render_results(output_formats: list[str]) -> None:
             full_text = "\n".join(lines)
         else:
             full_text = str(record["result"].get("text", "")).strip()
-        st.text_area("完整文字", value=full_text, height=420, disabled=True)
-        st.caption(f"共 {len(full_text):,} 個字元；點進文字框可全選複製。")
+        # A code block instead of the old disabled text area: that one faded the transcript
+        # to light grey, and a disabled field can't be focused to select-all and copy.
+        st.code(full_text or "（沒有文字）", language=None)
+        st.caption(f"共 {len(full_text):,} 個字元。滑鼠移到文字框右上角會出現複製按鈕，可一鍵複製全文。")
 
     with download_tab:
         if not output_formats:
@@ -1971,38 +2968,49 @@ def render_results(output_formats: list[str]) -> None:
             try:
                 destination = resolve_output_directory(record)
                 stem = output_stem(record)
-                st.markdown(f"**儲存位置**　`{destination}`")
-                if record.get("is_temp"):
-                    st.caption("上傳的檔案沒有原始路徑可寫回，因此存到 outputs/。")
-                else:
-                    st.caption("與原始檔案同一個資料夾。")
+                with st.container(border=True):
+                    st.markdown("**儲存到電腦**")
+                    render_html(f"<div class='tsr-file'>📁 {esc(destination)}</div>")
+                    if record.get("is_temp"):
+                        st.caption("上傳的檔案沒有原始路徑可寫回，因此存到 outputs/。")
+                    else:
+                        st.caption("與原始檔案同一個資料夾。")
 
-                existing = [
-                    f"{stem}.{extension}"
-                    for extension in output_formats
-                    if (destination / f"{stem}.{extension}").exists()
-                ]
-                if existing:
-                    st.warning(f"按下儲存會覆蓋既有檔案：{'、'.join(existing)}")
-
-                if st.button(
-                    "儲存到上述位置",
-                    key=f"save_files_{record['id']}",
-                    type="primary",
-                    use_container_width=True,
-                ):
-                    saved_directory, saved_files = save_result_files(record, output_formats)
-                    st.success(
-                        f"已儲存 {len(saved_files)} 個檔案到 {saved_directory}："
-                        f"{'、'.join(path.name for path in saved_files)}"
+                    existing = [
+                        f"{stem}.{extension}"
+                        for extension in output_formats
+                        if (destination / f"{stem}.{extension}").exists()
+                    ]
+                    names = "".join(
+                        chip(
+                            "覆蓋" if f"{stem}.{extension}" in existing else "新檔",
+                            f"{stem}.{extension}",
+                            warn=f"{stem}.{extension}" in existing,
+                        )
+                        for extension in output_formats
                     )
+                    render_html(f"<div class='tsr-chips'>{names}</div>")
+                    if existing:
+                        st.warning(f"按下儲存會覆蓋既有檔案：{'、'.join(existing)}")
 
-                st.divider()
+                    if st.button(
+                        "儲存到上述位置",
+                        key=f"save_files_{record['id']}",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        saved_directory, saved_files = save_result_files(record, output_formats)
+                        st.success(
+                            f"已儲存 {len(saved_files)} 個檔案到 {saved_directory}："
+                            f"{'、'.join(path.name for path in saved_files)}"
+                        )
+
+                st.markdown("**下載到瀏覽器**")
                 payloads = subtitle_payloads(record, output_formats)
                 download_columns = st.columns(len(payloads))
                 for index, (extension, filename, data) in enumerate(payloads):
                     download_columns[index].download_button(
-                        label=f"下載 .{extension}",
+                        label=f"⬇ 下載 .{extension}",
                         data=data,
                         file_name=filename,
                         mime=MIME_TYPES.get(extension, "text/plain"),

@@ -27,16 +27,25 @@ if (-not (Test-Path -LiteralPath $CondaHook)) {
 }
 
 . $CondaHook
-conda activate $CondaEnvironment
+$previousErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+conda activate $CondaEnvironment 2>$null
+$activationExitCode = $LASTEXITCODE
+$ErrorActionPreference = $previousErrorActionPreference
+
+if ($activationExitCode -ne 0) {
+    Write-Host "[ERROR] Conda environment activation failed: $CondaEnvironment"
+    exit 1
+}
 
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
     Write-Host "[ERROR] Python was not found after activating Conda."
     exit 1
 }
 
-if (-not (Get-Command streamlit -ErrorAction SilentlyContinue)) {
-    Write-Host "[ERROR] streamlit was not found after activating Conda."
-    Write-Host "Run: pip install -r requirements.txt"
+$bootstrapPath = Join-Path -Path $PSScriptRoot -ChildPath "streamlit_bootstrap.py"
+if (-not (Test-Path -LiteralPath $bootstrapPath)) {
+    Write-Host "[ERROR] streamlit_bootstrap.py was not found in this folder."
     exit 1
 }
 
@@ -47,8 +56,12 @@ if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue) -or
     exit 1
 }
 
-python -c "import numpy, opencc, plotly, streamlit, torch, transformers, whisper" 2>$null
-if ($LASTEXITCODE -ne 0) {
+$previousErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+python $bootstrapPath --check
+$dependencyExitCode = $LASTEXITCODE
+$ErrorActionPreference = $previousErrorActionPreference
+if ($dependencyExitCode -ne 0) {
     Write-Host "[ERROR] One or more Python packages are missing."
     Write-Host "Run: pip install -r requirements.txt"
     exit 1
@@ -59,11 +72,13 @@ if ($BindAddress -eq "tailscale") {
         Where-Object { $_.InterfaceAlias -like "*Tailscale*" } |
         Select-Object -First 1
     if (-not $tailscaleIp) {
-        Write-Host "[ERROR] No Tailscale interface was found. Start Tailscale, or set"
-        Write-Host "BIND_ADDRESS= (empty) in run_whisper.bat to listen on all interfaces."
-        exit 1
+        Write-Host "[WARN] No Tailscale interface was found. Falling back to localhost."
+        Write-Host "Only this computer will be able to open the app."
+        $BindAddress = "127.0.0.1"
     }
-    $BindAddress = $tailscaleIp.IPAddress
+    else {
+        $BindAddress = $tailscaleIp.IPAddress
+    }
 }
 
 $streamlitArgs = @("run", "whisper_app.py", "--server.maxUploadSize", $UploadLimitMb)
@@ -71,7 +86,12 @@ if ($BindAddress) {
     $streamlitArgs += @("--server.address", $BindAddress)
     Write-Host ""
     Write-Host "Listening on $BindAddress only - the local network cannot reach this."
-    Write-Host "Open http://${BindAddress}:8501 (works on this machine too; localhost will not)."
+    if ($BindAddress -eq "127.0.0.1") {
+        Write-Host "Open http://127.0.0.1:8501"
+    }
+    else {
+        Write-Host "Open http://${BindAddress}:8501 (works on this machine too; localhost will not)."
+    }
     Write-Host ""
 }
 else {
@@ -80,5 +100,9 @@ else {
     Write-Host ""
 }
 
-streamlit @streamlitArgs
-exit $LASTEXITCODE
+$previousErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+python $bootstrapPath @streamlitArgs
+$streamlitExitCode = $LASTEXITCODE
+$ErrorActionPreference = $previousErrorActionPreference
+exit $streamlitExitCode

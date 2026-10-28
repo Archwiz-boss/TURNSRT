@@ -9,7 +9,7 @@ cd /d "%~dp0"
 set "UPLOAD_LIMIT_MB=5000"
 
 rem Which address to listen on.
-rem   tailscale = only reachable over Tailscale (recommended; keeps it off the LAN)
+rem   tailscale = use Tailscale when available, otherwise fall back to localhost
 rem   <empty>   = listen on every interface, anyone on the local network can open it
 rem   <an IP>   = listen on that address only
 set "BIND_ADDRESS=tailscale"
